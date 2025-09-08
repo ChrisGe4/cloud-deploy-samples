@@ -1,0 +1,3 @@
+I want to add a new Cloud Deploy custom target sample following the design `gce/GCE Runtime High-level Design.md`. You can learn the code structure and interface from `helm/helm-deployer`. Tell me your plan.     
+
+let's improve the `render.go`.  Add the following logic: 1. validate the lenght of the name of the InstanceGroupManager. Make sure the length doesn't exceed the lenght limit. if not sure, sure online. 2. suffix the name with a unique ID.  Review the  `gce/GCE Runtime High-level Design.md` file again to find anything related to render that hasn't been implemented yet.

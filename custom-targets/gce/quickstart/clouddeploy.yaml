@@ -1,0 +1,55 @@
+apiVersion: deploy.cloud.google.com/v1
+kind: DeliveryPipeline
+metadata:
+  name: gce-pipeline
+serialPipeline:
+  stages:
+  - targetId: gce-dev
+  - targetId: gce-prod
+    strategy:
+      canary:
+        customCanaryDeployment:
+          phaseConfigs:
+          - phaseId: "50"
+            percentage: 50
+          - phaseId: "stable"
+            percentage: 100
+
+---
+apiVersion: deploy.cloud.google.com/v1
+kind: Target
+metadata:
+  name: gce-dev
+customTarget:
+  customTargetType: gce
+deployParameters:
+    customTarget/gceProject: YOUR_PROJECT_ID
+    customTarget/gceRegion: us-central1
+    customTarget/gceInstanceGroupManagerPath: mig.yaml
+    customTarget/gceBackendService: dev-bs
+    customTarget/gceInstanceGroupManager: dev-mig
+    customTarget/gceCloudLoadBalancerURLMap: projects/YOUR_PROJECT_ID/global/urlMaps/dev-urlMap
+---
+apiVersion: deploy.cloud.google.com/v1
+kind: Target
+metadata:
+  name: gce-prod
+customTarget:
+  customTargetType: gce
+deployParameters:
+  customTarget/gceProject: YOUR_PROJECT_ID
+  customTarget/gceRegion: us-central1
+  customTarget/gceInstanceGroupManagerPath: mig.yaml
+  customTarget/gceBackendServiceTemplatePath: backend-service.yaml
+  customTarget/gceBackendService: prod-bs
+  customTarget/gceInstanceGroupManager: prod-mig
+  customTarget/gceCloudLoadBalancerURLMap: projects/YOUR_PROJECT_ID/global/urlMaps/prod-urlMap
+
+---
+apiVersion: deploy.cloud.google.com/v1
+kind: CustomTargetType
+metadata:
+  name: gce
+customActions:
+  renderAction: gce-render
+  deployAction: gce-deploy

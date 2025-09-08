@@ -1,0 +1,16 @@
+apiVersion: compute.deploy.cloud.google.com/v1
+kind: BackendService
+metadata:
+  name: prod-bs
+spec:
+  backends:
+  - balancingMode: RATE
+    maxRate: 1000
+  description: Cloud Deploy managed backend service
+  healthChecks:
+  - https://www.googleapis.com/compute/v1/projects/YOUR_PROJECT_ID/global/healthChecks/prod-bs-health-check
+  loadBalancingScheme: INTERNAL_SELF_MANAGED
+  port: 80
+  portName: http
+  protocol: HTTP
+  timeoutSec: 30

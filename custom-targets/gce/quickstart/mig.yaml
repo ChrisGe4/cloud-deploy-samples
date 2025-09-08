@@ -1,0 +1,19 @@
+apiVersion: compute.deploy.cloud.google.com/v1
+kind: InstanceGroupManager
+metadata:
+  name: prod-mig
+spec:
+  instance_template: projects/YOUR_PROJECT_ID/global/instanceTemplates/app-v1
+  update_policy:
+    minimal_action:  "REPLACE"
+    most_disruptive_allowed_action : "REPLACE"
+    type:  "PROACTIVE"
+    max_unavailable_fixed:  0
+    replacement_method:  "SUBSTITUTE"
+  named_port:
+    name:  "lookup-service"
+    port:  8080
+  instance_lifecycle_policy:
+    force_update_on_repair:  "YES"
+  lifecycle:
+    create_before_destroy:  true
