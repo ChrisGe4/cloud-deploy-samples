@@ -6,6 +6,8 @@ This document provides a comprehensive snapshot of the current development progr
 
 The project's objective is to create a new Cloud Deploy custom target for deploying applications to Google Compute Engine (GCE), following the provided high-level design document. The core logic for the custom target deployer has been implemented in Go, along with a quickstart sample, build scripts, and documentation. The deployer can handle both standard and canary deployments, but the final cleanup step for old resources still needs to be implemented.
 
+The design document can be found at `[GCE Runtime High-level Design.md](GCE%20Runtime%20High-level%20Design.md)`.
+
 ## Detailed Progress Breakdown
 
 ### 1. `gce-deployer` Application
@@ -14,7 +16,14 @@ The core of the custom target is a Go application responsible for rendering and 
 
 -   **`main.go`**: Serves as the application's entry point. It determines whether the incoming request is for a `render` or `deploy` action and routes it to the appropriate handler. It also initializes the necessary clients (GCS, GCE).
 
--   **`params.go`**: Defines the `params` struct and the logic to parse deploy parameters from environment variables set by Cloud Deploy (e.g., `CLOUD_DEPLOY_customTarget_gceProject`).
+-   **`deploy.go`**: Handles the `deploy` action.
+    -   It parses the hydrated `InstanceGroupManager` and `BackendService` manifests.
+    -   It implements the main deployment workflows:
+        -   **Standard/Stable Deployment**: Calls `CreateMIG` and `UpdateBackendService`.
+        -   **Canary Deployment**: Creates a canary MIG, updates a separate canary backend service, retrieves the URL map using `GetURLMap`, calculates the new traffic weights, and applies the changes using `PatchURLMap`.
+    -   **Cleanup Logic**: Implemented the logic to clean up the old, previous stable MIG after a successful deployment. This uses the new `ListMIGs` method in the `GceClient` to find and delete stale resources.
+
+-   **`params.go`**: Refactored the `params` struct to better organize parameters. It now has nested structs for MIG-specific and BackendService-specific configurations (`migParams`, `backendServiceParams`). The `determineParams` function was updated accordingly, and all files that consume these parameters (`deploy.go`, `gce.go`, `render.go`) were updated to use the new structure.
 
 -   **`render.go`**: Handles the `render` action. Its key responsibilities include:
     -   Downloading and unarchiving the source input from GCS.
@@ -36,13 +45,6 @@ The core of the custom target is a Go application responsible for rendering and 
         -   `WaitForOperation`: A robust method that waits for long-running GCE operations to complete, with a timeout.
     -   **Resiliency**: All API-calling methods use a `retryOptions` helper that provides exponential backoff for transient errors (e.g., 5xx server errors, 429 rate limiting).
 
--   **`deploy.go`**: Handles the `deploy` action.
-    -   It parses the hydrated `InstanceGroupManager` and `BackendService` manifests.
-    -   It implements the main deployment workflows:
-        -   **Standard/Stable Deployment**: Calls `CreateMIG` and `UpdateBackendService`.
-        -   **Canary Deployment**: Creates a canary MIG, updates a separate canary backend service, retrieves the URL map using `GetURLMap`, calculates the new traffic weights, and applies the changes using `PatchURLMap`.
-    -   **`TODO`**: The logic to clean up the old, previous stable MIG after a successful deployment is not yet implemented.
-
 ### 2. Supporting Infrastructure
 
 -   **`Dockerfile`**: A multi-stage Dockerfile that builds the Go application and copies the binary into a minimal `distroless` image for a small footprint and improved security.
@@ -61,11 +63,10 @@ The core of the custom target is a Go application responsible for rendering and 
 
 ## Next Steps (Prompt to Continue)
 
-The initial implementation of the GCE custom target is complete, but the logic for cleaning up old Managed Instance Groups in `deploy.go` is missing. Your next task is to implement this cleanup logic.
+The core deployment and cleanup logic for the GCE custom target is now implemented. The next phase of development should focus on ensuring the solution is robust and maintainable.
 
 Here is the plan:
 
-1.  The final piece of the deployment logic is cleaning up the previous stable MIG after a successful standard deployment or after a canary deployment is fully promoted to 100%. This logic should be added to the `deploy` function in `deploy.go` inside the `if percentage == 0` block.
-2.  To implement this, you will first need to add a `ListMIGs` method to the `GceClient` in `gce.go`. This method should list all Managed Instance Groups in the project and location (zone or region) that match a given base name prefix (e.g., `dev-mig`).
-3.  In `deploy.go`, after the call to `UpdateBackendService` in the stable deployment path, call your new `ListMIGs` method.
-4.  Iterate through the list of returned MIGs. For each MIG, if its name does not match the name of the newly created MIG (which is available in the `igm` variable), call the existing `gceClient.DeleteMIG` method to remove it.
+1.  **Add Unit Tests**: Implement unit tests for the key logic in `render.go` and `deploy.go`. This will involve mocking GCS and GCE client interactions to test the manifest hydration and deployment workflows without needing live resources.
+2.  **Enhance Logging**: Improve the logging throughout the application to provide clearer, more structured output, which will aid in debugging.
+3.  **End-to-End Testing**: Thoroughly test the quickstart sample to validate both standard and canary deployment scenarios, including rollbacks.

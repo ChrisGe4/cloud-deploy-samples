@@ -95,21 +95,28 @@ func (r *renderer) render(ctx context.Context) (*clouddeploy.RenderResult, error
 	}
 	fmt.Printf("Downloaded render input archive from %s\n", inURI)
 
-	igmPath := r.params.instanceGroupManagerPath
+	igmPath := r.params.mig.instanceGroupManagerPath
 	if igmPath == "" {
 		igmPath = defaultInstanceGroupManagerManifest
 	}
 	fullIgmPath := path.Join(srcPath, igmPath)
 
-	bsPath := r.params.backendServiceTemplatePath
+	bsPath := r.params.backendService.templatePath
 	if bsPath == "" {
 		bsPath = defaultBackendServiceManifest
 	}
 	fullBsPath := path.Join(srcPath, bsPath)
 
-	hydratedIgm, err := r.hydrateInstanceGroupManager(fullIgmPath)
+	hydratedIgm, igm, err := r.hydrateInstanceGroupManager(fullIgmPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to hydrate InstanceGroupManager manifest: %v", err)
+	}
+	if r.params.instanceTemplate != "" {
+		spec, ok := igm["spec"].(map[interface{}](interface{}))
+		if !ok {
+			return nil, fmt.Errorf("invalid InstanceGroupManager manifest: missing spec")
+		}
+		spec["instance_template"] = r.params.instanceTemplate
 	}
 
 	allManifests := hydratedIgm
@@ -147,24 +154,24 @@ func (r *renderer) render(ctx context.Context) (*clouddeploy.RenderResult, error
 	return rr, nil
 }
 
-func (r *renderer) hydrateInstanceGroupManager(path string) ([]byte, error) {
+func (r *renderer) hydrateInstanceGroupManager(path string) ([]byte, map[string]interface{}, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
+		return nil, nil, fmt.Errorf("failed to read file: %w", err)
 	}
 
 	var igm map[string]interface{}
 	if err := yaml.Unmarshal(content, &igm); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal yaml: %w", err)
+		return nil, nil, fmt.Errorf("failed to unmarshal yaml: %w", err)
 	}
 
 	metadata, ok := igm["metadata"].(map[interface{}]interface{})
 	if !ok {
-		return nil, fmt.Errorf("invalid InstanceGroupManager manifest: missing metadata")
+		return nil, nil, fmt.Errorf("invalid InstanceGroupManager manifest: missing metadata")
 	}
 	name, ok := metadata["name"].(string)
 	if !ok {
-		return nil, fmt.Errorf("invalid InstanceGroupManager manifest: missing metadata.name")
+		return nil, nil, fmt.Errorf("invalid InstanceGroupManager manifest: missing metadata.name")
 	}
 	releaseName := r.req.Release
 	suffix := "-" + releaseName[len(releaseName)-8:]
@@ -177,14 +184,14 @@ func (r *renderer) hydrateInstanceGroupManager(path string) ([]byte, error) {
 	if r.params.instanceTemplate != "" {
 		spec, ok := igm["spec"].(map[interface{}]interface{})
 		if !ok {
-			return nil, fmt.Errorf("invalid InstanceGroupManager manifest: missing spec")
+			return nil, nil, fmt.Errorf("invalid InstanceGroupManager manifest: missing spec")
 		}
 		spec["instance_template"] = r.params.instanceTemplate
 	}
 
 	hydrated, err := yaml.Marshal(igm)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal yaml: %w", err)
+		return nil, nil, fmt.Errorf("failed to marshal yaml: %w", err)
 	}
-	return hydrated, nil
+	return hydrated, igm, nil
 }

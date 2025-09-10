@@ -1,3 +1,5 @@
+# GCE Runtime High-level Design
+
 # Objective
 
 This document outlines the design for integrating Google Compute Engine (GCE) as a deployment target within Google Cloud Deploy. The primary goal is to enable users to deploy and manage applications on GCE Virtual Machines (VMs) and Managed Instance Groups (MIGs) using Cloud Deploy's existing features, including progressive rollouts and automated rollbacks. 
@@ -93,8 +95,7 @@ metadata:
   name: my-mig 
 spec:
   # This field will be substituted by the deploy parameter at render time. 
-  instance_template: projects/[PROJECT_ID]/global/instanceTemplates/[INSTANCE_TEMPLATE_NAME_OR_ID] 
-  update_policy:
+  instance_template: projects/[PROJECT_ID]/global/instanceTemplates/[INSTANCE_TEMPLATE_NAME_OR_ID]   update_policy:
     minimal_action:  "REPLACE"
     most_disruptive_allowed_action : "REPLACE"
     type:  "PROACTIVE"
@@ -118,10 +119,8 @@ This template will be used to manage the backend service resources. It mirrors t
 apiVersion: compute.deploy.cloud.google.com/v1
 kind: BackendService
 metadata:
-  name: bs
+  name: bs # from-param ${customTarget/backendServiceName} 
 description: 'bs for gce deployment'
-# Region field decides whether the global or the regional API endpoint will be used to create the resource. 
-region: global/[region]
 backends:
 - balancingMode: RATE
   maxRatePerEndpoint: 5
@@ -173,20 +172,22 @@ strongSessionAffinityCookie: { }
 
 ```
 
-The renderer will use deployPararmeters passed to the containers as the environment variables for variable substitution.
+The renderer will use the deploy parameters passed to the containers as the environment variables for variable substitution.
 
 | Input | Description  |
 | :---- | :---- |
-| customTarget/gceProject | **Required.** The GCP project where GCE resources will be deployed. |
-| customTarget/gceRegion or customTarget/gceZone | **Required**. Specifies one of either region or zone for the MIG. Determines if regional or zonal APIs are used. |
-| customTarget/gceInstanceTemplate | The full URI of the instance template to deploy. This will substitute the `instance_template` field in the MIG template. If it is unset, the instance template specified in the MIG template will be used. |
+| customTarget/gceMigProject | **Required.** The GCP project where MIG will be deployed. |
+| customTarget/gceMigRegion or customTarget/gceMigZone | **Required**. Specifies one of either region or zone for the MIG. Determines if regional or zonal APIs are used. |
+| customTarget/gceBackendServiceProject | **Required.** The GCP project where Backend Service resources will be deployed. |
+| customTarget/gceBackendServiceRegion | **Required**. This field decides whether the global or the regional API endpoint will be used to create the resource. The value is either `global` or a specific region.  |
+| customTarget/gceInstanceTemplate | The [full or partial URI](https://cloud.google.com/compute/docs/instance-templates#how_to_specify_instance_templates) of the instance template to deploy. This will substitute the `instance_template` field in the MIG template. If it is unset, the instance template specified in the MIG template will be used. |
 | customTarget/gceInstanceGroupManager | The base name for the MIG to be created or managed. While we don't anticipate users having multiple templates, we are not restricting them to a single template. |
-| customTarget/gceBackendService | The name of the "stable" backend service. Required for canary deployments. For standard deployment, Backend Service will not be managed if this field is omitted.   |
+| customTarget/gceBackendService | **Required for canary deployments.** The name of the "stable" backend service.   For standard deployment, Backend Service will not be managed if this field is omitted.   |
 | customTarget/gceBackendServiceTemplatePath | Path to the `BackendService` template within the release archive. Defaults to `backend-service.yaml`.  |
 | customTarget/gceInstanceGroupManagerPath | Path to the `InstanceGroupManager` template within the release archive. Defaults to `mig.yaml`. |
 | customTarget/gceCloudLoadBalancerURLMap | **Required for canary deployments.** The full resource name of the URL Map to patch for traffic splitting. |
 
-The hydrated configuration files will be uploaded to the GCS bucket for the specific release phase, ready for the deployer
+The system will generate a manifest.yaml file containing all hydrated templates. This file will then be uploaded to the GCS bucket for the specific release phase, making it ready for the deployer. 
 
 ## Deploy
 
@@ -212,12 +213,16 @@ The canary process follows a blue/green-style strategy using two MIGs and two ba
 * **Backend Services:** The load balancer distributes traffic to a backend service based on its weight. The key is that this backend service can be dynamically configured to point to either the stable MIG or the canary MIG as its backend.  
 * **A Global External HTTPS Load Balancer:** Forwards the user traffic to the appropriate  Backend Service.
 
-**For each canary phase (e.g., 50%):**
+**For the first canary phase (e.g., 25%):**
 
 1. **Create Canary MIG:** The deployer creates the canary MIG using the new instance template and waits for it to become stable.  
 2. **Create/Update Canary Backend Service:** The deployer creates a `[MIG_NAME]-canary` backend service (if it doesn't exist).  
 3. **Link Canary MIG:** The new canary MIG is linked as the backend for the canary backend service.  
-4. **Update URL Map:** The deployer patches the URL map to split traffic. It identifies the rule referencing the stable backend service and inserts the canary backend service, adjusting the weights according to the phase percentage (e.g., `stable: 50`, `canary: 50`).
+4. **Update URL Map:** The deployer patches the URL map to split traffic. It identifies the rule referencing the stable backend service and inserts the canary backend service, adjusting the weights according to the phase percentage (e.g., `stable: 75`, `canary: 25`).
+
+**For subsequent canary phases (e.g., 50%, 75%):**
+
+1. **Update URL Map:** The deployer patches the URL map to adjust traffic weights, increasing the canary backend service's weight and decreasing the stable backend service's weight accordingly.
 
 **When advancing to the stable phase (100%):**
 
@@ -293,7 +298,7 @@ metadata:
 customTarget:
   customTargetType: gce
 deployParameters:
-  customTarget/gceProject: my-project
+    customTarget/gceProject: my-project
     customTarget/gceRegion: us-central1 
     customTarget/gceInstanceGroupManagerPath: prod/mig.yaml	        
     customTarget/gceBackendServiceTemplatePath: backend-service.yaml

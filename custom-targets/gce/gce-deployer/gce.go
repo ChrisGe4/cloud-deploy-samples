@@ -27,6 +27,7 @@ import (
 	computepb "cloud.google.com/go/compute/apiv1/computepb"
 	"github.com/googleapis/gax-go/v2"
 	"google.golang.org/api/googleapi"
+	"google.golang.org/api/iterator"
 )
 
 const (
@@ -44,9 +45,9 @@ var (
 type GceClient struct {
 	client                      *compute.InstanceGroupManagersClient
 	regionalClient              *compute.RegionInstanceGroupManagersClient
-	globalBackendServicesClient *compute.GlobalBackendServicesClient
+	globalBackendServicesClient *compute.BackendServicesClient
 	regionBackendServicesClient *compute.RegionBackendServicesClient
-	globalURLMapsClient         *compute.GlobalUrlMapsClient
+	globalURLMapsClient         *compute.UrlMapsClient
 	regionURLMapsClient         *compute.RegionUrlMapsClient
 }
 
@@ -60,7 +61,7 @@ func NewGceClient(ctx context.Context) (*GceClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create regional GCE service client: %w", err)
 	}
-	globalBackendServicesClient, err := compute.NewGlobalBackendServicesRESTClient(ctx)
+	globalBackendServicesClient, err := compute.NewBackendServicesRESTClient(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create GCE global backend services client: %w", err)
 	}
@@ -68,7 +69,7 @@ func NewGceClient(ctx context.Context) (*GceClient, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create GCE regional backend services client: %w", err)
 	}
-	globalURLMapsClient, err := compute.NewGlobalUrlMapsRESTClient(ctx)
+	globalURLMapsClient, err := compute.NewUrlMapsRESTClient(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create GCE global URL maps client: %w", err)
 	}
@@ -87,7 +88,7 @@ func NewGceClient(ctx context.Context) (*GceClient, error) {
 }
 
 // CreateMIG creates a new Managed Instance Group.
-func (g *GceClient) CreateMIG(ctx context.Context, params *params, igm *computepb.InstanceGroupManager) error {
+func (g *GceClient) CreateMIG(ctx context.Context, params *migParams, igm *computepb.InstanceGroupManager) error {
 	fmt.Printf("Creating Managed Instance Group %s\n", *igm.Name)
 	var op *compute.Operation
 	var err error
@@ -113,27 +114,82 @@ func (g *GceClient) CreateMIG(ctx context.Context, params *params, igm *computep
 	return g.WaitForOperation(ctx, op)
 }
 
-// UpdateBackendService creates or updates a Backend Service to point to a new MIG.
-func (g *GceClient) UpdateBackendService(ctx context.Context, params *params, bs *computepb.BackendService, igmLink string) error {
+// ListMIGs lists all Managed Instance Groups in a project and location that match a given name prefix.
+func (g *GceClient) ListMIGs(ctx context.Context, params *migParams, migNamePrefix string) ([]*computepb.InstanceGroupManager, error) {
+	var migs []*computepb.InstanceGroupManager
+	if params.zone != "" {
+		it := g.client.List(ctx, &computepb.ListInstanceGroupManagersRequest{
+			Project: params.project,
+			Zone:    params.zone,
+		}, retryOptions()...)
+		for {
+			mig, err := it.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				return nil, fmt.Errorf("failed to list MIGs: %w", err)
+			}
+			if strings.HasPrefix(*mig.Name, migNamePrefix) {
+				migs = append(migs, mig)
+			}
+		}
+	} else {
+		it := g.regionalClient.List(ctx, &computepb.ListRegionInstanceGroupManagersRequest{
+			Project: params.project,
+			Region:  params.region,
+		}, retryOptions()...)
+		for {
+			mig, err := it.Next()
+			if err == iterator.Done {
+				break
+			}
+			if err != nil {
+				return nil, fmt.Errorf("failed to list regional MIGs: %w", err)
+			}
+			if strings.HasPrefix(*mig.Name, migNamePrefix) {
+				migs = append(migs, mig)
+			}
+		}
+	}
+	return migs, nil
+}
+
+// GetMIG retrieves a Managed Instance Group.
+func (g *GceClient) GetMIG(ctx context.Context, params *migParams, migName string) (*computepb.InstanceGroupManager, error) {
+	if params.zone != "" {
+		return g.client.Get(ctx, &computepb.GetInstanceGroupManagerRequest{
+			Project:              params.project,
+			Zone:                 params.zone,
+			InstanceGroupManager: migName,
+		}, retryOptions()...)
+	}
+	return g.regionalClient.Get(ctx, &computepb.GetRegionInstanceGroupManagerRequest{
+		Project:              params.project,
+		Region:               params.region,
+		InstanceGroupManager: migName,
+	}, retryOptions()...)
+}
+
+// UpdateBackendService creates or updates a Backend Service.
+func (g *GceClient) UpdateBackendService(ctx context.Context, params *backendServiceParams, bs *computepb.BackendService) error {
 	fmt.Printf("Updating Backend Service %s\n", *bs.Name)
 	isRegional := params.region != "" && bs.Region != nil
-	var getOp *computepb.BackendService
+	var existing *computepb.BackendService
 	var getErr error
 
 	if isRegional {
-		getOp, getErr = g.regionBackendServicesClient.Get(ctx, &computepb.GetRegionBackendServiceRequest{
+		existing, getErr = g.regionBackendServicesClient.Get(ctx, &computepb.GetRegionBackendServiceRequest{
 			Project:        params.project,
 			Region:         params.region,
 			BackendService: *bs.Name,
 		}, retryOptions()...)
 	} else {
-		getOp, getErr = g.globalBackendServicesClient.Get(ctx, &computepb.GetGlobalBackendServiceRequest{
+		existing, getErr = g.globalBackendServicesClient.Get(ctx, &computepb.GetBackendServiceRequest{
 			Project:        params.project,
 			BackendService: *bs.Name,
 		}, retryOptions()...)
 	}
-
-	newBackend := &computepb.Backend{Group: &igmLink}
 
 	var op *compute.Operation
 	var opErr error
@@ -142,7 +198,6 @@ func (g *GceClient) UpdateBackendService(ctx context.Context, params *params, bs
 		var apiErr *googleapi.Error
 		if errors.As(getErr, &apiErr) && apiErr.Code == http.StatusNotFound {
 			fmt.Printf("Backend service %s not found, creating it.\n", *bs.Name)
-			bs.Backends = []*computepb.Backend{newBackend}
 			if isRegional {
 				op, opErr = g.regionBackendServicesClient.Insert(ctx, &computepb.InsertRegionBackendServiceRequest{
 					Project:                params.project,
@@ -150,7 +205,7 @@ func (g *GceClient) UpdateBackendService(ctx context.Context, params *params, bs
 					BackendServiceResource: bs,
 				}, retryOptions()...)
 			} else {
-				op, opErr = g.globalBackendServicesClient.Insert(ctx, &computepb.InsertGlobalBackendServiceRequest{
+				op, opErr = g.globalBackendServicesClient.Insert(ctx, &computepb.InsertBackendServiceRequest{
 					Project:                params.project,
 					BackendServiceResource: bs,
 				}, retryOptions()...)
@@ -160,6 +215,7 @@ func (g *GceClient) UpdateBackendService(ctx context.Context, params *params, bs
 		}
 	} else {
 		fmt.Printf("Backend service %s found, updating it.\n", *bs.Name)
+		bs.Fingerprint = existing.Fingerprint
 		if isRegional {
 			op, opErr = g.regionBackendServicesClient.Update(ctx, &computepb.UpdateRegionBackendServiceRequest{
 				Project:                params.project,
@@ -168,7 +224,7 @@ func (g *GceClient) UpdateBackendService(ctx context.Context, params *params, bs
 				BackendServiceResource: bs,
 			}, retryOptions()...)
 		} else {
-			op, opErr = g.globalBackendServicesClient.Update(ctx, &computepb.UpdateGlobalBackendServiceRequest{
+			op, opErr = g.globalBackendServicesClient.Update(ctx, &computepb.UpdateBackendServiceRequest{
 				Project:                params.project,
 				BackendService:         *bs.Name,
 				BackendServiceResource: bs,
@@ -183,6 +239,37 @@ func (g *GceClient) UpdateBackendService(ctx context.Context, params *params, bs
 	return g.WaitForOperation(ctx, op)
 }
 
+// GetBackendService retrieves a Backend Service.
+func (g *GceClient) GetBackendService(ctx context.Context, params *backendServiceParams) (*computepb.BackendService, error) {
+	fmt.Printf("Getting Backend Service %s\n", params.name)
+	isRegional := params.region != ""
+	var bs *computepb.BackendService
+	var err error
+
+	if isRegional {
+		bs, err = g.regionBackendServicesClient.Get(ctx, &computepb.GetRegionBackendServiceRequest{
+			Project:        params.project,
+			Region:         params.region,
+			BackendService: params.name,
+		}, retryOptions()...)
+	} else {
+		bs, err = g.globalBackendServicesClient.Get(ctx, &computepb.GetBackendServiceRequest{
+			Project:        params.project,
+			BackendService: params.name,
+		}, retryOptions()...)
+	}
+
+	if err != nil {
+		var apiErr *googleapi.Error
+		if errors.As(err, &apiErr) && apiErr.Code == http.StatusNotFound {
+			fmt.Printf("Backend service %s not found.\n", params.name)
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to get backend service %s: %w", params.name, err)
+	}
+	return bs, nil
+}
+
 // GetURLMap retrieves a URL Map.
 func (g *GceClient) GetURLMap(ctx context.Context, params *params) (*computepb.UrlMap, error) {
 	isRegional, urlMapName, err := parseURLMap(params.cloudLoadBalancerURLMap)
@@ -192,13 +279,13 @@ func (g *GceClient) GetURLMap(ctx context.Context, params *params) (*computepb.U
 
 	if isRegional {
 		return g.regionURLMapsClient.Get(ctx, &computepb.GetRegionUrlMapRequest{
-			Project: params.project,
-			Region:  params.region,
+			Project: params.backendService.project,
+			Region:  params.backendService.region,
 			UrlMap:  urlMapName,
 		}, retryOptions()...)
 	}
-	return g.globalURLMapsClient.Get(ctx, &computepb.GetGlobalUrlMapRequest{
-		Project: params.project,
+	return g.globalURLMapsClient.Get(ctx, &computepb.GetUrlMapRequest{
+		Project: params.backendService.project,
 		UrlMap:  urlMapName,
 	}, retryOptions()...)
 }
@@ -214,14 +301,14 @@ func (g *GceClient) PatchURLMap(ctx context.Context, params *params, urlMap *com
 	var op *compute.Operation
 	if isRegional {
 		op, err = g.regionURLMapsClient.Patch(ctx, &computepb.PatchRegionUrlMapRequest{
-			Project:        params.project,
-			Region:         params.region,
+			Project:        params.backendService.project,
+			Region:         params.backendService.region,
 			UrlMap:         urlMapName,
 			UrlMapResource: urlMap,
 		}, retryOptions()...)
 	} else {
-		op, err = g.globalURLMapsClient.Patch(ctx, &computepb.PatchGlobalUrlMapRequest{
-			Project:        params.project,
+		op, err = g.globalURLMapsClient.Patch(ctx, &computepb.PatchUrlMapRequest{
+			Project:        params.backendService.project,
 			UrlMap:         urlMapName,
 			UrlMapResource: urlMap,
 		}, retryOptions()...)
@@ -235,7 +322,7 @@ func (g *GceClient) PatchURLMap(ctx context.Context, params *params, urlMap *com
 }
 
 // DeleteMIG deletes a Managed Instance Group.
-func (g *GceClient) DeleteMIG(ctx context.Context, params *params, migName string) error {
+func (g *GceClient) DeleteMIG(ctx context.Context, params *migParams, migName string) error {
 	fmt.Printf("Deleting Managed Instance Group %s\n", migName)
 	var err error
 	if params.zone != "" {

@@ -38,38 +38,57 @@ const (
 
 // params contains the deploy parameter values passed into the execution environment.
 type params struct {
-	project                    string
-	region                     string
-	zone                       string
-	instanceTemplate           string
-	instanceGroupManager       string
-	backendService             string
-	backendServiceTemplatePath string
-	instanceGroupManagerPath   string
-	cloudLoadBalancerURLMap    string
+	mig                         migParams
+	backendService              backendServiceParams
+	instanceTemplate            string
+	cloudLoadBalancerURLMap     string
+}
+
+type migParams struct {
+	project                 string
+	region                  string
+	zone                    string
+	instanceGroupManager    string
+	instanceGroupManagerPath string
+}
+
+type backendServiceParams struct {
+	project      string
+	region       string
+	name         string
+	templatePath string
 }
 
 // determineParams returns the params provided in the execution environment via environment variables.
 func determineParams() (*params, error) {
-	project := os.Getenv(projectEnvKey)
-	if project == "" {
-		return nil, fmt.Errorf("parameter %q is required", projectEnvKey)
+	migProject := os.Getenv(projectMIGEnvKey)
+	bsProject := os.Getenv(projectBackendServiceEnvKey)
+	if migProject == "" && bsProject == "" {
+		return nil, fmt.Errorf("parameter %q or %q is required", projectMIGEnvKey, projectBackendServiceEnvKey)
 	}
-	region := os.Getenv(regionEnvKey)
-	zone := os.Getenv(zoneEnvKey)
-	if region == "" && zone == "" {
-		return nil, fmt.Errorf("one of parameter %q or %q is required", regionEnvKey, zoneEnvKey)
+
+	migRegion := os.Getenv(regionMIGEnvKey)
+	bsRegion := os.Getenv(regionBackendServiceEnvKey)
+	migZone := os.Getenv(zoneMIGEnvKey)
+	if migRegion == "" && migZone == "" {
+		return nil, fmt.Errorf("one of parameter %q or %q is required", regionMIGEnvKey, zoneMIGEnvKey)
 	}
 
 	return &params{
-		project:                    project,
-		region:                     region,
-		zone:                       zone,
-		instanceTemplate:           os.Getenv(instanceTemplateEnvKey),
-		instanceGroupManager:       os.Getenv(instanceGroupManagerEnvKey),
-		backendService:             os.Getenv(backendServiceEnvKey),
-		backendServiceTemplatePath: os.Getenv(backendServiceTemplatePathKey),
-		instanceGroupManagerPath:   os.Getenv(instanceGroupManagerPathEnvKey),
-		cloudLoadBalancerURLMap:    os.Getenv(cloudLoadBalancerURLMapEnvKey),
+		mig: migParams{
+			project:                  migProject,
+			region:                   migRegion,
+			zone:                     migZone,
+			instanceGroupManager:     os.Getenv(instanceGroupManagerEnvKey),
+			instanceGroupManagerPath: os.Getenv(instanceGroupManagerPathEnvKey),
+		},
+		backendService: backendServiceParams{
+			project:      bsProject,
+			region:       bsRegion,
+			name:         os.Getenv(backendServiceEnvKey),
+			templatePath: os.Getenv(backendServiceTemplatePathKey),
+		},
+		instanceTemplate:        os.Getenv(instanceTemplateEnvKey),
+		cloudLoadBalancerURLMap: os.Getenv(cloudLoadBalancerURLMapEnvKey),
 	}, nil
 }
