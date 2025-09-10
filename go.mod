@@ -12,6 +12,7 @@ require (
 	github.com/fsouza/fake-gcs-server v1.52.2
 	github.com/ghodss/yaml v1.0.0
 	github.com/google/go-cmp v0.7.0
+	github.com/google/go-cpy v0.0.0-20211218193943-a9c933c06932
 	github.com/googleapis/gax-go/v2 v2.15.0
 	github.com/hashicorp/hcl/v2 v2.24.0
 	github.com/hashicorp/terraform-json v0.18.0

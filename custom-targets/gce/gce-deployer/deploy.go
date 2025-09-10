@@ -132,28 +132,75 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 		//  4. Start redirecting traffic to stable backend service by updating the weights of the stable and canary backend services
 		//     in the specified route.
 		//  5. Delete the original stable MIG.
-		
-		var oldMIGs []string
-		stableBS, err := d.gceClient.GetBackendService(ctx, &backendServiceParams{
-			project: d.params.backendService.project,
-			region:  d.params.backendService.region,
-			name:    stableSvc,
-		})
-		
-		
 
-		if err != nil {                                                                                               │
-         // A not found error is acceptable, it means this is the first deployment.                                │
-         var apiErr *googleapi.Error                                                                               │
-         if errors.As(err, &apiErr) && apiErr.Code != http.StatusNotFound {                                        │
-           return nil, fmt.Errorf("failed to get stable backend service: %w", err)                                   │
-       }     
-		if stableBS != nil {
-			for _, backend := range stableBS.Backends {
-				parts := strings.Split(*backend.Group, "/")
-				oldMIGs = append(oldMIGs, parts[len(parts)-1])
+		urlMap, err := d.gceClient.GetURLMap(ctx, d.params)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get URL map: %w", err)
+		}
+		var canaryBackends []*computepb.Backend
+		if isBackendServiceInURLMap(urlMap, canarySvcFullName) {
+			canaryBS, err := d.gceClient.GetBackendService(ctx, &backendServiceParams{
+				project: d.params.backendService.project,
+				region:  d.params.backendService.region,
+				name:    canarySvc,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to get canary backend service: %w", err)
+			}
+			canaryBackends = canaryBS.GetBackends()
+		}
+		stableBS := manifests.bs
+		var stableBackends []*computepb.Backend
+		if isBackendServiceInURLMap(urlMap, stableSvcFullName) {
+			bs, err := d.gceClient.GetBackendService(ctx, &backendServiceParams{
+				project: d.params.backendService.project,
+				region:  d.params.backendService.region,
+				name:    stableSvc,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to get canary backend service: %w", err)
+			}
+			stableBackends = bs.GetBackends()
+		}
+
+		if len(canaryBackends) != 0 {
+			stableBS.Backends = canaryBackends
+		} else {
+			stableBS.Backends = stableBackends
+		}
+		if err := d.gceClient.UpdateBackendService(ctx, &d.params.backendService, stableBS); err != nil {
+			return nil, fmt.Errorf("failed to update canary backend service: %w", err)
+		}
+
+		// create mig if backends is empty
+		if len(stableBS.GetBackends()) == 0 {
+			if err := d.gceClient.CreateMIG(ctx, &d.params.mig, igm); err != nil {
+				return nil, fmt.Errorf("failed to create MIG: %w", err)
+			}
+			// Update the backends of the canary backend service with the MIG created above.
+			bes, err := generateBackendServiceBackends(ctx, d.gceClient, &d.params.mig, *igm.Name, beTemplate)
+			if err != nil {
+				return nil, fmt.Errorf("failed to generate backend service backends: %w", err)
+			}
+			stableBS.Backends = bes
+			if err := d.gceClient.UpdateBackendService(ctx, &d.params.backendService, manifests.bs); err != nil {
+				return nil, fmt.Errorf("failed to update canary backend service: %w", err)
 			}
 		}
+
+		//if err != nil {
+		//	// A not found error is acceptable, it means this is the first deployment.
+		//	var apiErr *googleapi.Error
+		//	if errors.As(err, &apiErr) && apiErr.Code != http.StatusNotFound {
+		//		return nil, fmt.Errorf("failed to get stable backend service: %w", err)
+		//	}
+		//}
+		//if stableBS != nil {
+		//	for _, backend := range stableBS.Backends {
+		//		parts := strings.Split(*backend.Group, "/")
+		//		oldMIGs = append(oldMIGs, parts[len(parts)-1])
+		//	}
+		//}
 
 		bes, err := generateBackendServiceBackends(ctx, d.gceClient, &d.params.mig, *igm.Name, beTemplate)
 		if err != nil {
@@ -163,11 +210,6 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 		manifests.bs.Name = proto.String(stableSvc)
 		if err := d.gceClient.UpdateBackendService(ctx, &d.params.backendService, manifests.bs); err != nil {
 			return nil, fmt.Errorf("failed to update stable backend service: %w", err)
-		}
-
-		urlMap, err := d.gceClient.GetURLMap(ctx, d.params)
-		if err != nil {
-			return nil, fmt.Errorf("failed to get URL map: %w", err)
 		}
 
 		setRouteWeightStableWrapper := func(pm *computepb.PathMatcher, stable, canary string, p int) error {
@@ -204,7 +246,7 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 		if err != nil {
 			return nil, fmt.Errorf("failed to get URL map: %w", err)
 		}
-		if !isBackendServiceInURLMap(urlMap, stableSvc) {
+		if !isBackendServiceInURLMap(urlMap, stableSvcFullName) {
 			return &clouddeploy.DeployResult{
 				ResultStatus: clouddeploy.DeploySkipped,
 				SkipMessage:  fmt.Sprintf("Stable backend service %s not found in URL map %s, skipping canary deployment", stableSvc, d.params.cloudLoadBalancerURLMap),
@@ -304,7 +346,7 @@ func isBackendServiceInURLMap(urlMap *computepb.UrlMap, backendService string) b
 		for _, rr := range pm.RouteRules {
 			if rr.RouteAction != nil {
 				for _, wbs := range rr.RouteAction.WeightedBackendServices {
-					if strings.HasSuffix(*wbs.BackendService, "/"+backendService) {
+					if *wbs.BackendService == backendService {
 						return true
 					}
 				}
