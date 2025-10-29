@@ -116,11 +116,11 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 	stableSvcFullName := constructBackendServiceFullName(d.params.backendService.project, bsRegion, stableSvc)
 	canarySvc := stableSvc + "-canary"
 	canarySvcFullName := constructBackendServiceFullName(d.params.backendService.project, bsRegion, canarySvc)
-
-	igm := manifests.igm
-	if err := d.gceClient.CreateMIG(ctx, &d.params.mig, igm); err != nil {
-		return nil, fmt.Errorf("failed to create MIG: %w", err)
-	}
+	migName := *manifests.igm.Name
+	// igm := manifests.igm
+	// if err := d.gceClient.CreateMIG(ctx, &d.params.mig, igm); err != nil {
+	// 	return nil, fmt.Errorf("failed to create MIG: %w", err)
+	// }
 
 	percentage := d.req.Percentage
 	if percentage == 0 || percentage == 100 {
@@ -138,8 +138,9 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 			return nil, fmt.Errorf("failed to get URL map: %w", err)
 		}
 		var canaryBackends []*computepb.Backend
+		var canaryBackendService *computepb.BackendService
 		if isBackendServiceInURLMap(urlMap, canarySvcFullName) {
-			canaryBS, err := d.gceClient.GetBackendService(ctx, &backendServiceParams{
+			canaryBackendService, err = d.gceClient.GetBackendService(ctx, &backendServiceParams{
 				project: d.params.backendService.project,
 				region:  d.params.backendService.region,
 				name:    canarySvc,
@@ -147,9 +148,9 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 			if err != nil {
 				return nil, fmt.Errorf("failed to get canary backend service: %w", err)
 			}
-			canaryBackends = canaryBS.GetBackends()
+			canaryBackends = canaryBackendService.GetBackends()
 		}
-		stableBS := manifests.bs
+		stableBackendService := manifests.bs
 		var stableBackends []*computepb.Backend
 		if isBackendServiceInURLMap(urlMap, stableSvcFullName) {
 			bs, err := d.gceClient.GetBackendService(ctx, &backendServiceParams{
@@ -158,57 +159,60 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 				name:    stableSvc,
 			})
 			if err != nil {
-				return nil, fmt.Errorf("failed to get canary backend service: %w", err)
+				return nil, fmt.Errorf("failed to get stable backend service: %w", err)
 			}
 			stableBackends = bs.GetBackends()
 		}
 
 		if len(canaryBackends) != 0 {
-			stableBS.Backends = canaryBackends
+			stableBackendService.Backends = canaryBackends
 		} else {
-			stableBS.Backends = stableBackends
+			stableBackendService.Backends = stableBackends
 		}
-		if err := d.gceClient.UpdateBackendService(ctx, &d.params.backendService, stableBS); err != nil {
+		// Pick up the changes in the new backend service template.
+		if err := d.gceClient.UpdateBackendService(ctx, &d.params.backendService, stableBackendService); err != nil {
 			return nil, fmt.Errorf("failed to update canary backend service: %w", err)
 		}
 
-		// create mig if backends is empty
-		if len(stableBS.GetBackends()) == 0 {
-			if err := d.gceClient.CreateMIG(ctx, &d.params.mig, igm); err != nil {
-				return nil, fmt.Errorf("failed to create MIG: %w", err)
+		// create the mig either if the backends is empty or it is standard deployment.
+		if len(stableBackendService.GetBackends()) == 0 || percentage == 0 {
+			mig, err := d.gceClient.GetMIG(ctx, &d.params.mig, migName)
+			if err != nil {
+				var apiErr *googleapi.Error
+				if errors.As(err, &apiErr) && apiErr.Code != http.StatusNotFound {
+					return nil, fmt.Errorf("failed to get MIG: %w", err)
+				}
 			}
-			// Update the backends of the canary backend service with the MIG created above.
-			bes, err := generateBackendServiceBackends(ctx, d.gceClient, &d.params.mig, *igm.Name, beTemplate)
+			if mig == nil {
+				// Since the MIG is deterministic per release, only creates the MIG if it doesn't exist.
+				if err := d.gceClient.CreateMIG(ctx, &d.params.mig, manifests.igm); err != nil {
+					return nil, fmt.Errorf("failed to create MIG: %w", err)
+				}
+			}
+			// Update the backends of the stable backend service to reference the MIG created above.
+			bes, err := generateBackendServiceBackends(ctx, d.gceClient, &d.params.mig, migName, mig, beTemplate)
 			if err != nil {
 				return nil, fmt.Errorf("failed to generate backend service backends: %w", err)
 			}
-			stableBS.Backends = bes
-			if err := d.gceClient.UpdateBackendService(ctx, &d.params.backendService, manifests.bs); err != nil {
-				return nil, fmt.Errorf("failed to update canary backend service: %w", err)
-			}
+			stableBackendService.Backends = bes
 		}
 
-		//if err != nil {
+		// if err != nil {
 		//	// A not found error is acceptable, it means this is the first deployment.
 		//	var apiErr *googleapi.Error
 		//	if errors.As(err, &apiErr) && apiErr.Code != http.StatusNotFound {
 		//		return nil, fmt.Errorf("failed to get stable backend service: %w", err)
 		//	}
-		//}
-		//if stableBS != nil {
-		//	for _, backend := range stableBS.Backends {
+		// }
+		// if stableBackendService != nil {
+		//	for _, backend := range stableBackendService.Backends {
 		//		parts := strings.Split(*backend.Group, "/")
 		//		oldMIGs = append(oldMIGs, parts[len(parts)-1])
 		//	}
-		//}
+		// }
 
-		bes, err := generateBackendServiceBackends(ctx, d.gceClient, &d.params.mig, *igm.Name, beTemplate)
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate backend service backends: %w", err)
-		}
-		manifests.bs.Backends = bes
-		manifests.bs.Name = proto.String(stableSvc)
-		if err := d.gceClient.UpdateBackendService(ctx, &d.params.backendService, manifests.bs); err != nil {
+		// stableBackendService.Name = proto.String(stableSvc)
+		if err := d.gceClient.UpdateBackendService(ctx, &d.params.backendService, stableBackendService); err != nil {
 			return nil, fmt.Errorf("failed to update stable backend service: %w", err)
 		}
 
@@ -219,29 +223,33 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 			return nil, err
 		}
 
-		for _, migName := range oldMIGs {
-			if migName == *igm.Name {
-				continue
-			}
-			fmt.Printf("Deleting old stable MIG %s\n", migName)
-			if err := d.gceClient.DeleteMIG(ctx, &d.params.mig, migName); err != nil {
-				fmt.Printf("failed to delete old stable MIG %s: %v\n", migName, err)
+		// Clean up process starts here.
+		for _, backend := range stableBackends {
+			parts := strings.Split(*backend.Group, "/")
+			migToDelete := parts[len(parts)-1]
+			fmt.Printf("Deleting old stable MIG %s\n", migToDelete)
+			if err := d.gceClient.DeleteMIG(ctx, &d.params.mig, migToDelete); err != nil {
+				fmt.Printf("failed to delete old stable MIG %s: %v\n", migToDelete, err)
 			}
 		}
 
 		if percentage == 100 {
-			fmt.Printf("Deleting canary backend service %s\n", canarySvc)
-			if err := d.gceClient.DeleteBackendService(ctx, &d.params.backendService, canarySvc); err != nil {
-				fmt.Printf("failed to delete canary backend service %s: %v\n", canarySvc, err)
+			fmt.Printf("Resetting the backends in the canary backend service %s\n", canarySvc)
+			if canaryBackendService != nil {
+				canaryBackendService.Backends = nil
 			}
 		}
 	} else {
 		// The canary phase consists of the following manifest apply steps:
+		//  For the first phase:
 		//  1. Create the canary backend service with empty backends.
 		//  2. Create the MIG for the canary backend service.
 		//  3. Update the backends of the canary backend service with the MIG created in (2).
 		//  4. Start splitting traffic by updating the weights of the stable and canary backend services
 		//     in the specified route.
+		//  For the subsequent phases:
+		//  - Split traffic by updating the weights of the stable and canary backend services
+		//	  in the specified route.
 		urlMap, err := d.gceClient.GetURLMap(ctx, d.params)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get URL map: %w", err)
@@ -256,27 +264,53 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 				},
 			}, nil
 		}
-		// Create Backend Service. This also allow us to catch the BS failure before
-		// applying the manifest.
 		manifests.bs.Backends = nil
 		manifests.bs.Name = proto.String(canarySvc)
+		if isBackendServiceInURLMap(urlMap, canarySvcFullName) {
+			bs, err := d.gceClient.GetBackendService(ctx, &backendServiceParams{
+				project: d.params.backendService.project,
+				region:  d.params.backendService.region,
+				name:    canarySvc,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("failed to get canary backend service: %w", err)
+			}
+			// Keep the existing backends of the canary backend service.
+			manifests.bs.Backends = bs.GetBackends()
+		}
+		// Apply the Backend Service manifest. This also allow us to catch the BS failure before
+		// creating the MIG.
 		if err := d.gceClient.UpdateBackendService(ctx, &d.params.backendService, manifests.bs); err != nil {
 			return nil, fmt.Errorf("failed to update canary backend service: %w", err)
 		}
-		// Creat the MIG.
-		igm := manifests.igm
-		if err := d.gceClient.CreateMIG(ctx, &d.params.mig, igm); err != nil {
-			return nil, fmt.Errorf("failed to create MIG: %w", err)
+		mig, err := d.gceClient.GetMIG(ctx, &d.params.mig, migName)
+		if err != nil {
+			var apiErr *googleapi.Error
+			if errors.As(err, &apiErr) && apiErr.Code != http.StatusNotFound {
+				return nil, fmt.Errorf("failed to get MIG: %w", err)
+			}
 		}
-		// Update the backends of the canary backend service with the MIG created above.
-		bes, err := generateBackendServiceBackends(ctx, d.gceClient, &d.params.mig, *igm.Name, beTemplate)
+		if mig == nil {
+			// Since the MIG is deterministic per release, only creates the MIG if it doesn't exist.
+			if err := d.gceClient.CreateMIG(ctx, &d.params.mig, manifests.igm); err != nil {
+				return nil, fmt.Errorf("failed to create MIG: %w", err)
+			}
+		}
+
+		// Update the backends of the canary backend service to reference the MIG created above.
+		bes, err := generateBackendServiceBackends(ctx, d.gceClient, &d.params.mig, migName, mig, beTemplate)
 		if err != nil {
 			return nil, fmt.Errorf("failed to generate backend service backends: %w", err)
 		}
-		manifests.bs.Backends = bes
-		if err := d.gceClient.UpdateBackendService(ctx, &d.params.backendService, manifests.bs); err != nil {
-			return nil, fmt.Errorf("failed to update canary backend service: %w", err)
+		// manifests.bs.Backends should either be nil(for the first phase) or contains the desired MIG.
+		// Add more checks here for the complex scenario.
+		if len(manifests.bs.Backends) != len(bes) && len(bes) != 0 {
+			manifests.bs.Backends = bes
+			if err := d.gceClient.UpdateBackendService(ctx, &d.params.backendService, manifests.bs); err != nil {
+				return nil, fmt.Errorf("failed to update canary backend service: %w", err)
+			}
 		}
+
 		if err := d.redirectTraffic(ctx, urlMap, stableSvcFullName, canarySvcFullName, percentage, setRouteWeightForCanary); err != nil {
 			return nil, err
 		}
@@ -467,6 +501,9 @@ func addRouteCanaryBackendService(action *computepb.HttpRouteAction, stable *com
 // redirectTraffic redirects traffic between the canary backend service and
 // the stable backend service by updating their weights in the specified route.
 func (d *deployer) redirectTraffic(ctx context.Context, urlMap *computepb.UrlMap, stableBSFullname, canaryBSFullname string, percentage int, setRouteWeightFn func(*computepb.PathMatcher, string, string, int) error) error {
+	if urlMap == nil {
+		return nil
+	}
 	fmt.Println("Updating the weights in the url map")
 
 	initializeBackendServiceInTheRoute(urlMap, stableBSFullname)
@@ -517,17 +554,32 @@ func constructBackendServiceFullName(project, region, name string) string {
 	return fmt.Sprintf("projects/%s/locations/%s/backendServices/%s", project, region, name)
 }
 
-// Creates the computepb.backend resource with the backend template defined manifest and the MIG created by the deployer.
-func generateBackendServiceBackends(ctx context.Context, compute *GceClient, params *migParams, migName string, beTemplate *computepb.Backend) ([]*computepb.Backend, error) {
-	mig, err := compute.GetMIG(ctx, params, migName)
-	if err != nil {
-		return nil, err
+// Creates the computepb.backend resource with the backend template defined in manifest and the MIG created by the deployer.
+func generateBackendServiceBackends(ctx context.Context, compute *GceClient, params *migParams, migName string, mig *computepb.InstanceGroupManager, beTemplate *computepb.Backend) ([]*computepb.Backend, error) {
+	var err error
+	if mig == nil {
+		mig, err = compute.GetMIG(ctx, params, migName)
+		if err != nil {
+			return nil, err
+		}
 	}
-	// Create the `backend` field based on the template and the generated NEGs.
+	// Create the `backend` field based on the template and the previously created MIG.
 	be := cpy.New(cpy.IgnoreAllUnexported()).Copy(beTemplate).(*computepb.Backend)
 	be.Group = proto.String(*mig.SelfLink)
 	bes := []*computepb.Backend{
 		be,
+	}
+
+	return bes, nil
+}
+
+// Update the backends resource with the backend template defined in manifest and the existing MIGs.
+func updateBackendServiceBackends(ctx context.Context, compute *GceClient, backends []*computepb.Backend, beTemplate *computepb.Backend) ([]*computepb.Backend, error) {
+	var bes []*computepb.Backend
+	for _, backend := range backends {
+		// Pick up the new backend template and the generated NEGs.
+		be := cpy.New(cpy.IgnoreAllUnexported()).Copy(beTemplate).(*computepb.Backend)
+		be.Group = backend.Group
 	}
 
 	return bes, nil

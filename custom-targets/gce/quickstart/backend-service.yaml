@@ -1,7 +1,7 @@
 apiVersion: compute.deploy.cloud.google.com/v1
 kind: BackendService
 metadata:
-  name: prod-bs
+  name: prod-bs # from-param ${customTarget/backendServiceName}
 spec:
   backends:
   - balancingMode: RATE
