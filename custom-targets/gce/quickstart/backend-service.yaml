@@ -8,7 +8,7 @@ spec:
     maxRate: 1000
   description: Cloud Deploy managed backend service
   healthChecks:
-  - https://www.googleapis.com/compute/v1/projects/YOUR_PROJECT_ID/global/healthChecks/prod-bs-health-check
+  - https://www.googleapis.com/compute/v1/projects/chris-test1-475920/global/healthChecks/gce-health-check
   loadBalancingScheme: INTERNAL_SELF_MANAGED
   port: 80
   portName: http

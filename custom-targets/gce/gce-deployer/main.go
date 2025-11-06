@@ -44,7 +44,7 @@ func do() error {
 	if err != nil {
 		return fmt.Errorf("unable to create cloud storage client: %v", err)
 	}
-	req, err := clouddeploy.DetermineRequest(ctx, gcsClient, []string{})
+	req, err := clouddeploy.DetermineRequest(ctx, gcsClient, []string{"CANARY"})
 	if err != nil {
 		return fmt.Errorf("unable to determine cloud deploy request: %v", err)
 	}

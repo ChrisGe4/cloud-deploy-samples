@@ -12,12 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM golang:1.20 as builder
-WORKDIR /app
-COPY . .
-RUN CGO_ENABLED=0 go build -o /gce-deployer .
+ARG GO_VERSION=1.24
+ARG COMMIT_SHA=unknown
 
-FROM gcr.io/distroless/static-debian11
+FROM golang:${GO_VERSION} as builder
+WORKDIR /app
+COPY go.mod go.sum ./
+COPY packages/ ./packages/
+COPY custom-targets/util/ ./custom-targets/util/
+COPY custom-targets/gce/gce-deployer/*.go ./custom-targets/gce/gce-deployer/
+RUN go mod download
+#RUN CGO_ENABLED=0 go build -ldflags="-X github.com/GoogleCloudPlatform/cloud-deploy-samples/custom-targets/util/clouddeploy.GitCommit=${COMMIT_SHA}" -o /gce-deployer .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-X github.com/GoogleCloudPlatform/cloud-deploy-samples/custom-targets/util/clouddeploy.GitCommit=${COMMIT_SHA}" -o /gce-deployer ./custom-targets/gce/gce-deployer/
+
+FROM gcr.io/distroless/static-debian12:latest
 WORKDIR /
 COPY --from=builder /gce-deployer /gce-deployer
+
 ENTRYPOINT ["/gce-deployer"]

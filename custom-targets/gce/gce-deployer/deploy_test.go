@@ -2,6 +2,7 @@
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
+// You may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 
 //     https://www.apache.org/licenses/LICENSE-2.0
@@ -16,6 +17,8 @@ package main
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 
 	computepb "cloud.google.com/go/compute/apiv1/computepb"
@@ -23,19 +26,36 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// gceMIGGetter is an interface for mocking the GCE client.
-type gceMIGGetter interface {
-	GetMIG(ctx context.Context, params *migParams, migName string) (*computepb.InstanceGroupManager, error)
-}
-
 type mockGceClient struct {
-	GceClient
-	getMIG func(ctx context.Context, params *migParams, migName string) (*computepb.InstanceGroupManager, error)
+	getMIG               func(ctx context.Context, params *migParams, migName string) (*computepb.InstanceGroupManager, error)
+	getURLMap            func(ctx context.Context, params *params) (*computepb.UrlMap, error)
+	getBackendService    func(ctx context.Context, params *backendServiceParams) (*computepb.BackendService, error)
+	updateBackendService func(ctx context.Context, params *backendServiceParams, bs *computepb.BackendService) error
+	createMIG            func(ctx context.Context, params *migParams, igm *computepb.InstanceGroupManager) error
+	deleteMIG            func(ctx context.Context, params *migParams, migName string) error
+	patchURLMap          func(ctx context.Context, params *params, urlMap *computepb.UrlMap) error
 }
-
 
 func (m *mockGceClient) GetMIG(ctx context.Context, params *migParams, migName string) (*computepb.InstanceGroupManager, error) {
 	return m.getMIG(ctx, params, migName)
+}
+func (m *mockGceClient) GetURLMap(ctx context.Context, params *params) (*computepb.UrlMap, error) {
+	return m.getURLMap(ctx, params)
+}
+func (m *mockGceClient) GetBackendService(ctx context.Context, params *backendServiceParams) (*computepb.BackendService, error) {
+	return m.getBackendService(ctx, params)
+}
+func (m *mockGceClient) UpdateBackendService(ctx context.Context, params *backendServiceParams, bs *computepb.BackendService) error {
+	return m.updateBackendService(ctx, params, bs)
+}
+func (m *mockGceClient) CreateMIG(ctx context.Context, params *migParams, igm *computepb.InstanceGroupManager) error {
+	return m.createMIG(ctx, params, igm)
+}
+func (m *mockGceClient) DeleteMIG(ctx context.Context, params *migParams, migName string) error {
+	return m.deleteMIG(ctx, params, migName)
+}
+func (m *mockGceClient) PatchURLMap(ctx context.Context, params *params, urlMap *computepb.UrlMap) error {
+	return m.patchURLMap(ctx, params, urlMap)
 }
 
 func TestGenerateBackendServiceBackends(t *testing.T) {
@@ -53,7 +73,7 @@ func TestGenerateBackendServiceBackends(t *testing.T) {
 		Description: proto.String("test backend"),
 	}
 
-	got, err := generateBackendServiceBackends(context.Background(), mockClient, &migParams{}, fakeMIGName, beTemplate)
+	got, err := generateBackendServiceBackends(context.Background(), mockClient, &migParams{}, fakeMIGName, nil, beTemplate)
 	if err != nil {
 		t.Fatalf("generateBackendServiceBackends() returned error: %v", err)
 	}
@@ -68,4 +88,95 @@ func TestGenerateBackendServiceBackends(t *testing.T) {
 	if diff := cmp.Diff(want, got, cmp.Comparer(proto.Equal)); diff != "" {
 		t.Errorf("generateBackendServiceBackends() returned diff (-want +got):\n%s", diff)
 	}
+}
+
+func TestParseManifests(t *testing.T) {
+	tests := []struct {
+		name       string
+		manifest   string
+		shouldFail bool
+	}{
+		{
+			name:     "Valid manifests",
+			manifest: "\napiVersion: compute.deploy.cloud.google.com/v1\nkind: InstanceGroupManager\nmetadata:\n  name: \"test-mig\"\n---\napiVersion: compute.deploy.cloud.google.com/v1\nkind: BackendService\nmetadata:\n  name: \"test-bs\"",
+		},
+		{
+			name:       "Missing InstanceGroupManager",
+			manifest:   "\napiVersion: compute.deploy.cloud.google.com/v1\nkind: BackendService\nmetadata:\n  name: \"test-bs\"",
+			shouldFail: true,
+		},
+		{
+			name:       "Malformed manifest",
+			manifest:   "{ ",
+			shouldFail: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			manifestPath := filepath.Join(tmpDir, "manifest.yaml")
+			if err := os.WriteFile(manifestPath, []byte(test.manifest), 0644); err != nil {
+				t.Fatalf("failed to write manifest file: %v", err)
+			}
+			d := &deployer{}
+			_, err := d.parseManifests(manifestPath)
+			if test.shouldFail {
+				if err == nil {
+					t.Fatal("expected parsing to fail but it succeeded")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parsing failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestSetRouteWeight(t *testing.T) {
+	stableBS := "stable-bs"
+	canaryBS := "canary-bs"
+	pathMatcher := &computepb.PathMatcher{
+		Name: proto.String("test-path-matcher"),
+		RouteRules: []*computepb.HttpRouteRule{
+			{
+				RouteAction: &computepb.HttpRouteAction{
+					WeightedBackendServices: []*computepb.WeightedBackendService{
+						{
+							BackendService: proto.String(stableBS),
+							Weight:         proto.Uint32(100),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	t.Run("Set canary weight", func(t *testing.T) {
+		if err := setRouteWeightForCanary(pathMatcher, stableBS, canaryBS, 50); err != nil {
+			t.Fatalf("setRouteWeightForCanary failed: %v", err)
+		}
+		if len(pathMatcher.RouteRules[0].RouteAction.WeightedBackendServices) != 2 {
+			t.Fatal("expected 2 backend services after setting canary weight")
+		}
+		if *pathMatcher.RouteRules[0].RouteAction.WeightedBackendServices[0].Weight != 50 {
+			t.Errorf("expected stable backend service weight to be 50, got %d", *pathMatcher.RouteRules[0].RouteAction.WeightedBackendServices[0].Weight)
+		}
+		if *pathMatcher.RouteRules[0].RouteAction.WeightedBackendServices[1].Weight != 50 {
+			t.Errorf("expected canary backend service weight to be 50, got %d", *pathMatcher.RouteRules[0].RouteAction.WeightedBackendServices[1].Weight)
+		}
+	})
+
+	t.Run("Set stable weight", func(t *testing.T) {
+		if err := setRouteWeightForStable(pathMatcher, stableBS, canaryBS, 100); err != nil {
+			t.Fatalf("setRouteWeightForStable failed: %v", err)
+		}
+		if len(pathMatcher.RouteRules[0].RouteAction.WeightedBackendServices) != 1 {
+			t.Fatal("expected 1 backend service after setting stable weight")
+		}
+		if *pathMatcher.RouteRules[0].RouteAction.WeightedBackendServices[0].Weight != 100 {
+			t.Errorf("expected stable backend service weight to be 100, got %d", *pathMatcher.RouteRules[0].RouteAction.WeightedBackendServices[0].Weight)
+		}
+	})
 }

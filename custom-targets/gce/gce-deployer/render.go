@@ -15,15 +15,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
 	"path"
+	"strings"
 
 	"cloud.google.com/go/storage"
 	"github.com/GoogleCloudPlatform/cloud-deploy-samples/custom-targets/util/clouddeploy"
 	"github.com/GoogleCloudPlatform/cloud-deploy-samples/packages/gcs"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -39,6 +41,8 @@ const (
 	defaultBackendServiceManifest = "backend-service.yaml"
 	// The maximum length of a GCE resource name.
 	maxGceResourceNameLength = 63
+	// fromParamCommentPrefix is the comment prefix that indicates that a field's value should be substituted from a deploy parameter.
+	fromParamCommentPrefix = "# from-param "
 )
 
 // renderer implements the requestHandler interface for render requests.
@@ -95,6 +99,11 @@ func (r *renderer) render(ctx context.Context) (*clouddeploy.RenderResult, error
 	}
 	fmt.Printf("Downloaded render input archive from %s\n", inURI)
 
+	allParams := getAllParams()
+	fmt.Println("all params is ", allParams)
+
+	fmt.Println("render request is ", r.req)
+
 	igmPath := r.params.mig.instanceGroupManagerPath
 	if igmPath == "" {
 		igmPath = defaultInstanceGroupManagerManifest
@@ -107,26 +116,24 @@ func (r *renderer) render(ctx context.Context) (*clouddeploy.RenderResult, error
 	}
 	fullBsPath := path.Join(srcPath, bsPath)
 
-	hydratedIgm, igm, err := r.hydrateInstanceGroupManager(fullIgmPath)
+	hydratedIgmBytes, igm, err := hydrateInstanceGroupManager(fullIgmPath, allParams, r.req.Release)
 	if err != nil {
 		return nil, fmt.Errorf("failed to hydrate InstanceGroupManager manifest: %v", err)
 	}
 	if r.params.instanceTemplate != "" {
-		spec, ok := igm["spec"].(map[interface{}](interface{}))
-		if !ok {
-			return nil, fmt.Errorf("invalid InstanceGroupManager manifest: missing spec")
+		if err := setNestedField(igm.Content[0], r.params.instanceTemplate, "spec", "instance_template"); err != nil {
+			return nil, fmt.Errorf("failed to set instance template in InstanceGroupManager manifest: %v", err)
 		}
-		spec["instance_template"] = r.params.instanceTemplate
 	}
 
-	allManifests := hydratedIgm
+	allManifests := hydratedIgmBytes
 	if _, err := os.Stat(fullBsPath); err == nil {
-		bsContent, err := os.ReadFile(fullBsPath)
+		hydratedBsBytes, err := hydrateBackendService(fullBsPath, allParams)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read BackendService manifest: %v", err)
+			return nil, fmt.Errorf("failed to hydrate BackendService manifest: %v", err)
 		}
 		allManifests = append(allManifests, []byte("\n---\n")...)
-		allManifests = append(allManifests, bsContent...)
+		allManifests = append(allManifests, hydratedBsBytes...)
 	}
 
 	fmt.Println("Uploading hydrated manifests")
@@ -154,44 +161,145 @@ func (r *renderer) render(ctx context.Context) (*clouddeploy.RenderResult, error
 	return rr, nil
 }
 
-func (r *renderer) hydrateInstanceGroupManager(path string) ([]byte, map[string]interface{}, error) {
+// hydrateBackendService reads in the BackendService YAML file at the provided path and substitutes values from deploy parameters where specified.
+func hydrateBackendService(path string, params map[string]string) ([]byte, error) {
+	hydrated, _, err := hydrate(path, params)
+	if err != nil {
+		return nil, err
+	}
+	return hydrated, nil
+}
+
+func hydrateInstanceGroupManager(path string, params map[string]string, releaseName string) ([]byte, *yaml.Node, error) {
+	_, node, err := hydrate(path, params)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	m, err := findMapValue(node.Content[0], "metadata")
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid InstanceGroupManager manifest: missing metadata")
+	}
+	n, err := findMapValue(m, "name")
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid InstanceGroupManager manifest: missing metadata.name")
+	}
+	name := n.Value
+	releaseSuffix := releaseName
+	if len(releaseName) > 8 {
+		releaseSuffix = releaseName[len(releaseName)-8:]
+	}
+	suffix := "-" + releaseSuffix
+	maxBaseNameLength := maxGceResourceNameLength - len(suffix)
+	if len(name) > maxBaseNameLength {
+		name = name[:maxBaseNameLength]
+	}
+	n.Value = name + suffix
+
+	var hydrated bytes.Buffer
+	encoder := yaml.NewEncoder(&hydrated)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(node); err != nil {
+		return nil, nil, fmt.Errorf("failed to marshal yaml: %w", err)
+	}
+	return hydrated.Bytes(), node, nil
+}
+
+// hydrate reads in the YAML file at the provided path and substitutes values from deploy parameters where specified.
+// A field in the YAML file can specify that it should be substituted by providing a comment on the same line of the
+// form:
+//
+//	key: value # from-param ${customTarget/paramKey}
+//
+// The value for the field will be the value of the deploy parameter.
+func hydrate(path string, params map[string]string) ([]byte, *yaml.Node, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to read file: %w", err)
 	}
 
-	var igm map[string]interface{}
-	if err := yaml.Unmarshal(content, &igm); err != nil {
+	var root yaml.Node
+	if err := yaml.Unmarshal(content, &root); err != nil {
 		return nil, nil, fmt.Errorf("failed to unmarshal yaml: %w", err)
 	}
 
-	metadata, ok := igm["metadata"].(map[interface{}]interface{})
-	if !ok {
-		return nil, nil, fmt.Errorf("invalid InstanceGroupManager manifest: missing metadata")
-	}
-	name, ok := metadata["name"].(string)
-	if !ok {
-		return nil, nil, fmt.Errorf("invalid InstanceGroupManager manifest: missing metadata.name")
-	}
-	releaseName := r.req.Release
-	suffix := "-" + releaseName[len(releaseName)-8:]
-	maxBaseNameLength := maxGceResourceNameLength - len(suffix)
-	if len(name) > maxBaseNameLength {
-		name = name[:maxBaseNameLength]
-	}
-	metadata["name"] = name + suffix
-
-	if r.params.instanceTemplate != "" {
-		spec, ok := igm["spec"].(map[interface{}]interface{})
-		if !ok {
-			return nil, nil, fmt.Errorf("invalid InstanceGroupManager manifest: missing spec")
-		}
-		spec["instance_template"] = r.params.instanceTemplate
+	if err := traverse(&root, params); err != nil {
+		return nil, nil, fmt.Errorf("failed to traverse yaml node: %w", err)
 	}
 
-	hydrated, err := yaml.Marshal(igm)
-	if err != nil {
+	var hydrated bytes.Buffer
+	encoder := yaml.NewEncoder(&hydrated)
+	encoder.SetIndent(2)
+	if err := encoder.Encode(&root); err != nil {
 		return nil, nil, fmt.Errorf("failed to marshal yaml: %w", err)
 	}
-	return hydrated, igm, nil
+
+	return hydrated.Bytes(), &root, nil
+}
+
+// traverse traverses a YAML node, substituting values from deploy parameters where specified.
+func traverse(node *yaml.Node, params map[string]string) error {
+	if node == nil {
+		return nil
+	}
+
+	if node.LineComment != "" {
+		if strings.HasPrefix(node.LineComment, fromParamCommentPrefix) {
+			paramKey := strings.TrimSpace(strings.TrimPrefix(node.LineComment, fromParamCommentPrefix))
+			// The deploy parameter format is ${customTarget/key}, remove the surrounding chars.
+			paramKey = strings.TrimSuffix(strings.TrimPrefix(paramKey, "${"), "}")
+			if val, ok := params[paramKey]; ok {
+				node.Value = val
+			}
+		}
+	}
+
+	for _, child := range node.Content {
+		if err := traverse(child, params); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func findMapValue(node *yaml.Node, key string) (*yaml.Node, error) {
+	for i := 0; i < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			return node.Content[i+1], nil
+		}
+	}
+	return nil, fmt.Errorf("key %q not found", key)
+}
+
+func setNestedField(node *yaml.Node, value string, keys ...string) error {
+	for _, key := range keys[:len(keys)-1] {
+		var err error
+		node, err = findMapValue(node, key)
+		if err != nil {
+			return err
+		}
+	}
+	lastKey := keys[len(keys)-1]
+	for i := 0; i < len(node.Content); i += 2 {
+		if node.Content[i].Value == lastKey {
+			node.Content[i+1].Value = value
+			return nil
+		}
+	}
+	// Key doesn't exist, so add it.
+	node.Content = append(node.Content, &yaml.Node{Kind: yaml.ScalarNode, Value: lastKey}, &yaml.Node{Kind: yaml.ScalarNode, Value: value})
+	return nil
+}
+
+func getAllParams() map[string]string {
+	params := make(map[string]string)
+	for _, e := range os.Environ() {
+		if strings.HasPrefix(e, "CLOUD_DEPLOY_") {
+			pair := strings.SplitN(e, "=", 2)
+			key := strings.TrimPrefix(pair[0], "CLOUD_DEPLOY_")
+			key = strings.ReplaceAll(key, "_", "/")
+			params[key] = pair[1]
+		}
+	}
+	return params
 }

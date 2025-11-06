@@ -15,41 +15,15 @@
 
 set -e
 
-if [[ $# -ne 1 ]]; then
-  echo "Usage: $0 <project_id>"
-  exit 1
-fi
+#!/bin/bash
 
-PROJECT_ID="$1"
-REGION="us-central1"
-CUSTOM_TARGET_TYPE="gce"
-CUSTOM_TARGET_IMAGE_NAME="gce-deployer"
-GCR_HOSTNAME="gcr.io"
-RENDER_IMAGE_URI="${GCR_HOSTNAME}/${PROJECT_ID}/${CUSTOM_TARGET_IMAGE_NAME}:render"
-DEPLOY_IMAGE_URI="${GCR_HOSTNAME}/${PROJECT_ID}/${CUSTOM_TARGET_IMAGE_NAME}:deploy"
+SOURCE_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+export _CT_DOCKERFILE_LOCATION="custom-targets/gce/gce-deployer/Dockerfile"
+export _CT_SRCDIR="${SOURCE_DIR}/gce-deployer"
+export _CT_IMAGE_NAME=gce
+export _CT_TYPE_NAME=gce
+export _CT_CUSTOM_ACTION_NAME=gce-deployer
+export _CT_GCS_DIRECTORY=gce
+export _CT_SKAFFOLD_CONFIG_NAME=gceConfig
 
-echo "Enabling APIs..."
-gcloud services enable cloudbuild.googleapis.com clouddeploy.googleapis.com --project="${PROJECT_ID}"
-
-echo "Building GCE deployer image..."
-gcloud builds submit gce-deployer --project="${PROJECT_ID}" --tag="${RENDER_IMAGE_URI}"
-gcloud builds submit gce-deployer --project="${PROJECT_ID}" --tag="${DEPLOY_IMAGE_URI}"
-
-
-echo "Registering GCE custom target type..."
-cat <<EOF | gcloud deploy custom-target-types apply --region="${REGION}" --project="${PROJECT_ID}" --file=-
-apiVersion: deploy.cloud.google.com/v1
-kind: CustomTargetType
-metadata:
-  name: ${CUSTOM_TARGET_TYPE}
-description: GCE custom target
-customActions:
-  renderAction:
-    gcsObject:
-      bucket: cloud-deploy-custom-targets
-      object: gce-deployer.tgz
-  deployAction:
-    containerImage: ${DEPLOY_IMAGE_URI}
-EOF
-
-echo "GCE custom target type registration complete."
+"${SOURCE_DIR}/../util/build_and_register.sh" "$@"

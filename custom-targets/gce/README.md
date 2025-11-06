@@ -33,6 +33,40 @@ gcloud config set project "${PROJECT_ID}"
 
     This script will build the `gce-deployer` container image and register it as a custom target type named `gce` in Cloud Deploy.
 
+## Manifest Hydration
+
+The `gce-deployer` supports hydrating GCE manifests with values from Cloud Deploy parameters. This allows you to define placeholders in your manifests and have their values dynamically substituted at release time.
+
+To mark a field in your YAML manifest for substitution, add a comment on the same line in the following format:
+
+```yaml
+# from-param ${customTarget/paramKey}
+```
+
+Where `paramKey` is the key of the parameter defined in your `clouddeploy.yaml`. For example, a parameter `customTarget/backendServiceName` would be referenced as `${customTarget/backendServiceName}`.
+
+### Example
+
+Consider the following `backend-service.yaml`:
+
+```yaml
+apiVersion: compute.deploy.cloud.google.com/v1
+kind: BackendService
+metadata:
+  name: "prod-bs" # from-param ${customTarget/backendServiceName}
+```
+
+And the corresponding `clouddeploy.yaml` with a parameter:
+
+```yaml
+...
+      deployParameters:
+        customTarget/backendServiceName: "my-backend-service"
+...
+```
+
+During the render phase, the `gce-deployer` will replace `"prod-bs"` with `"my-backend-service"`.
+
 ## Usage
 
 1.  **Create the delivery pipeline and targets:**

@@ -1,6 +1,2 @@
 apiVersion: skaffold/v2beta29
 kind: Config
-build:
-  artifacts:
-  - image: gcr.io/google-samples/hello-app
-    context: .

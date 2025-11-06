@@ -3,7 +3,7 @@ kind: InstanceGroupManager
 metadata:
   name: prod-mig
 spec:
-  instance_template: projects/YOUR_PROJECT_ID/global/instanceTemplates/app-v1
+  instance_template: projects/chris-test1-475920/global/instanceTemplates/app-v1
   update_policy:
     minimal_action:  "REPLACE"
     most_disruptive_allowed_action : "REPLACE"

@@ -16,12 +16,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
 	"net/http"
 	"os"
-	"path/filepath"
+	"path"
 	"slices"
 	"strings"
 
@@ -29,7 +30,6 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/GoogleCloudPlatform/cloud-deploy-samples/custom-targets/util/clouddeploy"
 	"github.com/google/go-cpy/cpy"
-	"github.com/mholt/archiver/v3"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
@@ -51,11 +51,17 @@ type deployer struct {
 // process processes a deploy request and uploads succeeded or failed results to GCS for Cloud Deploy.
 func (d *deployer) process(ctx context.Context) error {
 	fmt.Println("Processing deploy request")
-
+	dr := &clouddeploy.DeployResult{
+		ResultStatus: clouddeploy.DeploySucceeded,
+		Metadata: map[string]string{
+			clouddeploy.CustomTargetSourceMetadataKey:    gceDeployerSampleName,
+			clouddeploy.CustomTargetSourceSHAMetadataKey: clouddeploy.GitCommit,
+		},
+	}
 	res, err := d.deploy(ctx)
 	if err != nil {
 		fmt.Printf("Deploy failed: %v\n", err)
-		dr := &clouddeploy.DeployResult{
+		dr = &clouddeploy.DeployResult{
 			ResultStatus:   clouddeploy.DeployFailed,
 			FailureMessage: err.Error(),
 			Metadata: map[string]string{
@@ -63,17 +69,13 @@ func (d *deployer) process(ctx context.Context) error {
 				clouddeploy.CustomTargetSourceSHAMetadataKey: clouddeploy.GitCommit,
 			},
 		}
-		fmt.Println("Uploading failed deploy results")
-		rURI, err := d.req.UploadResult(ctx, d.gcsClient, dr)
-		if err != nil {
-			return fmt.Errorf("error uploading failed deploy results: %v", err)
-		}
-		fmt.Printf("Uploaded failed deploy results to %s\n", rURI)
-		return err
+	}
+	if res != nil {
+		dr = res
 	}
 
 	fmt.Println("Uploading deploy results")
-	rURI, err := d.req.UploadResult(ctx, d.gcsClient, res)
+	rURI, err := d.req.UploadResult(ctx, d.gcsClient, dr)
 	if err != nil {
 		return fmt.Errorf("error uploading deploy results: %v", err)
 	}
@@ -86,23 +88,31 @@ func (d *deployer) process(ctx context.Context) error {
 //  2. Create or update GCE resources based on the manifests.
 //  3. Upload deploy artifacts.
 func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error) {
-	fmt.Printf("Downloading rendered configuration archive to %s\n", srcArchivePath)
-	inURI, err := d.req.DownloadInput(ctx, d.gcsClient, renderedArchiveName, srcArchivePath)
+	// fmt.Printf("Downloading rendered configuration archive to %s\n", srcArchivePath)
+	// inURI, err := d.req.DownloadInput(ctx, d.gcsClient, renderedArchiveName, srcArchivePath)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("unable to download deploy input with object suffix %s: %v", renderedArchiveName, err)
+	// }
+	// fmt.Printf("Downloaded rendered configuration archive from %s\n", inURI)
+	//
+	// archiveFile, err := os.Open(srcArchivePath)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("unable to open archive file %s: %v", srcArchivePath, err)
+	// }
+	// fmt.Printf("Unarchiving rendered configuration in %s to %s\n", srcArchivePath, srcPath)
+	// if err := archiver.NewTarGz().Unarchive(archiveFile.Name(), srcPath); err != nil {
+	// 	return nil, fmt.Errorf("unable to unarchive rendered configuration: %v", err)
+	// }
+	manifestFile := "manifest.yaml"
+	renderedDeploymentPath := path.Join(srcPath, manifestFile)
+	fmt.Printf("Downloading rendered Deployment to %s\n", renderedDeploymentPath)
+	dURI, err := d.req.DownloadInput(ctx, d.gcsClient, manifestFile, renderedDeploymentPath)
 	if err != nil {
-		return nil, fmt.Errorf("unable to download deploy input with object suffix %s: %v", renderedArchiveName, err)
+		return nil, fmt.Errorf("unable to download rendered deployment with object suffix %s: %v", manifestFile, err)
 	}
-	fmt.Printf("Downloaded rendered configuration archive from %s\n", inURI)
+	fmt.Printf("Downloaded rendered Deployment from %s\n", dURI)
 
-	archiveFile, err := os.Open(srcArchivePath)
-	if err != nil {
-		return nil, fmt.Errorf("unable to open archive file %s: %v", srcArchivePath, err)
-	}
-	fmt.Printf("Unarchiving rendered configuration in %s to %s\n", srcArchivePath, srcPath)
-	if err := archiver.NewTarGz().Unarchive(archiveFile.Name(), srcPath); err != nil {
-		return nil, fmt.Errorf("unable to unarchive rendered configuration: %v", err)
-	}
-
-	manifests, err := d.parseManifests()
+	manifests, err := d.parseManifests(renderedDeploymentPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse manifests: %w", err)
 	}
@@ -121,7 +131,7 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 	// if err := d.gceClient.CreateMIG(ctx, &d.params.mig, igm); err != nil {
 	// 	return nil, fmt.Errorf("failed to create MIG: %w", err)
 	// }
-
+	backendServiceNameProvided := len(stableSvc) != 0
 	percentage := d.req.Percentage
 	if percentage == 0 || percentage == 100 {
 		// Standard deployment or promoting canary to 100%
@@ -132,7 +142,14 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 		//  4. Start redirecting traffic to stable backend service by updating the weights of the stable and canary backend services
 		//     in the specified route.
 		//  5. Delete the original stable MIG.
-
+		//  For standard deployment, if the backendService name if not provided,
+		if !backendServiceNameProvided {
+			_, err := d.getOrCreateMIG(ctx, migName, manifests)
+			if err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
 		urlMap, err := d.gceClient.GetURLMap(ctx, d.params)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get URL map: %w", err)
@@ -176,18 +193,9 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 
 		// create the mig either if the backends is empty or it is standard deployment.
 		if len(stableBackendService.GetBackends()) == 0 || percentage == 0 {
-			mig, err := d.gceClient.GetMIG(ctx, &d.params.mig, migName)
+			mig, err := d.getOrCreateMIG(ctx, migName, manifests)
 			if err != nil {
-				var apiErr *googleapi.Error
-				if errors.As(err, &apiErr) && apiErr.Code != http.StatusNotFound {
-					return nil, fmt.Errorf("failed to get MIG: %w", err)
-				}
-			}
-			if mig == nil {
-				// Since the MIG is deterministic per release, only creates the MIG if it doesn't exist.
-				if err := d.gceClient.CreateMIG(ctx, &d.params.mig, manifests.igm); err != nil {
-					return nil, fmt.Errorf("failed to create MIG: %w", err)
-				}
+				return nil, err
 			}
 			// Update the backends of the stable backend service to reference the MIG created above.
 			bes, err := generateBackendServiceBackends(ctx, d.gceClient, &d.params.mig, migName, mig, beTemplate)
@@ -250,6 +258,9 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 		//  For the subsequent phases:
 		//  - Split traffic by updating the weights of the stable and canary backend services
 		//	  in the specified route.
+		if !backendServiceNameProvided {
+			return nil, fmt.Errorf("backend service name is required for canary deployment")
+		}
 		urlMap, err := d.gceClient.GetURLMap(ctx, d.params)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get URL map: %w", err)
@@ -327,14 +338,30 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 	return dr, nil
 }
 
+func (d *deployer) getOrCreateMIG(ctx context.Context, migName string, manifests *manifests) (*computepb.InstanceGroupManager, error) {
+	mig, err := d.gceClient.GetMIG(ctx, &d.params.mig, migName)
+	if err != nil {
+		var apiErr *googleapi.Error
+		if errors.As(err, &apiErr) && apiErr.Code != http.StatusNotFound {
+			return nil, fmt.Errorf("failed to get MIG: %w", err)
+		}
+	}
+	if mig == nil {
+		// Since the MIG is deterministic per release, only creates the MIG if it doesn't exist.
+		if err := d.gceClient.CreateMIG(ctx, &d.params.mig, manifests.igm); err != nil {
+			return nil, fmt.Errorf("failed to create MIG: %w", err)
+		}
+	}
+	return mig, nil
+}
+
 type manifests struct {
 	igm *computepb.InstanceGroupManager
 	bs  *computepb.BackendService
 }
 
-func (d *deployer) parseManifests() (*manifests, error) {
-	manifestFile := filepath.Join(srcPath, "manifest.yaml")
-	data, err := os.ReadFile(manifestFile)
+func (d *deployer) parseManifests(manifestPath string) (*manifests, error) {
+	data, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read manifest file: %w", err)
 	}
@@ -342,30 +369,51 @@ func (d *deployer) parseManifests() (*manifests, error) {
 	var m manifests
 	yamls := strings.Split(string(data), "\n---\n")
 	for _, y := range yamls {
-		var typeMeta struct {
-			Kind string `yaml:"kind"`
-		}
-		if err := sigsk8s.Unmarshal([]byte(y), &typeMeta); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal kind: %w", err)
+		var obj map[string]interface{}
+		if err := sigsk8s.Unmarshal([]byte(y), &obj); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal manifest: %w", err)
 		}
 
-		jsonBytes, err := sigsk8s.YAMLToJSON([]byte(y))
+		kind, ok := obj["kind"].(string)
+		if !ok {
+			return nil, fmt.Errorf("manifest is missing kind field")
+		}
+		delete(obj, "kind")
+		delete(obj, "apiVersion")
+
+		metadata, ok := obj["metadata"].(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("manifest is missing metadata field")
+		}
+		delete(obj, "metadata")
+
+		jsonBytes, err := json.Marshal(obj)
 		if err != nil {
-			return nil, fmt.Errorf("failed to convert YAML to JSON: %w", err)
+			return nil, fmt.Errorf("failed to marshal manifest: %w", err)
 		}
 
-		switch typeMeta.Kind {
+		switch kind {
 		case "InstanceGroupManager":
 			var igm computepb.InstanceGroupManager
 			if err := protojson.Unmarshal(jsonBytes, &igm); err != nil {
 				return nil, fmt.Errorf("failed to unmarshal InstanceGroupManager: %w", err)
 			}
+			name, ok := metadata["name"].(string)
+			if !ok {
+				return nil, fmt.Errorf("InstanceGroupManager manifest is missing metadata.name field")
+			}
+			igm.Name = &name
 			m.igm = &igm
 		case "BackendService":
 			var bs computepb.BackendService
 			if err := protojson.Unmarshal(jsonBytes, &bs); err != nil {
 				return nil, fmt.Errorf("failed to unmarshal BackendService: %w", err)
 			}
+			name, ok := metadata["name"].(string)
+			if !ok {
+				return nil, fmt.Errorf("BackendService manifest is missing metadata.name field")
+			}
+			bs.Name = &name
 			m.bs = &bs
 		}
 	}
@@ -527,8 +575,26 @@ func initializeBackendServiceInTheRoute(urlMap *computepb.UrlMap, stableBSFullna
 		return
 	}
 	if len(urlMap.GetPathMatchers()) == 0 {
-		// 0 weight will be ignored.
-		// todo: add the first rule with the stableBSFullname then return.
+		urlMap.PathMatchers = []*computepb.PathMatcher{
+			{
+				Name: proto.String("path-matcher-0"),
+				RouteRules: []*computepb.HttpRouteRule{
+					{
+						Priority: proto.Int32(1),
+						RouteAction: &computepb.HttpRouteAction{
+							WeightedBackendServices: []*computepb.WeightedBackendService{
+								{
+									BackendService: &stableBSFullname,
+									Weight:         proto.Uint32(100),
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+		urlMap.DefaultService = &stableBSFullname
+		return
 	}
 
 	for _, rule := range urlMap.GetPathMatchers()[0].GetRouteRules() {
@@ -554,8 +620,19 @@ func constructBackendServiceFullName(project, region, name string) string {
 	return fmt.Sprintf("projects/%s/locations/%s/backendServices/%s", project, region, name)
 }
 
+// gceClientInterface provides an interface for mocking the GCE client.
+type gceClientInterface interface {
+	GetMIG(ctx context.Context, params *migParams, migName string) (*computepb.InstanceGroupManager, error)
+	GetURLMap(ctx context.Context, params *params) (*computepb.UrlMap, error)
+	GetBackendService(ctx context.Context, params *backendServiceParams) (*computepb.BackendService, error)
+	UpdateBackendService(ctx context.Context, params *backendServiceParams, bs *computepb.BackendService) error
+	CreateMIG(ctx context.Context, params *migParams, igm *computepb.InstanceGroupManager) error
+	DeleteMIG(ctx context.Context, params *migParams, migName string) error
+	PatchURLMap(ctx context.Context, params *params, urlMap *computepb.UrlMap) error
+}
+
 // Creates the computepb.backend resource with the backend template defined in manifest and the MIG created by the deployer.
-func generateBackendServiceBackends(ctx context.Context, compute *GceClient, params *migParams, migName string, mig *computepb.InstanceGroupManager, beTemplate *computepb.Backend) ([]*computepb.Backend, error) {
+func generateBackendServiceBackends(ctx context.Context, compute gceClientInterface, params *migParams, migName string, mig *computepb.InstanceGroupManager, beTemplate *computepb.Backend) ([]*computepb.Backend, error) {
 	var err error
 	if mig == nil {
 		mig, err = compute.GetMIG(ctx, params, migName)
@@ -583,4 +660,8 @@ func updateBackendServiceBackends(ctx context.Context, compute *GceClient, backe
 	}
 
 	return bes, nil
+}
+
+func getOrCreateMG() {
+
 }
