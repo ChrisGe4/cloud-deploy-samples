@@ -272,6 +272,10 @@ func (d *DeployRequest) UploadResult(ctx context.Context, gcsClient *storage.Cli
 	return uri, nil
 }
 
+func (d *DeployRequest) GetPercentage() int {
+	return d.Percentage
+}
+
 // DetermineRequest determines the Cloud Deploy request based on the environment variables in the
 // execution environment and returns either a RenderRequest or DeployRequest. If the request
 // includes a feature that is not in provided supported features list then a NOT_SUPPORTED result

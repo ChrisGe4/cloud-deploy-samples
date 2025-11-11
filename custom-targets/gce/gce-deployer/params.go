@@ -38,17 +38,17 @@ const (
 
 // params contains the deploy parameter values passed into the execution environment.
 type params struct {
-	mig                         migParams
-	backendService              backendServiceParams
-	instanceTemplate            string
-	cloudLoadBalancerURLMap     string
+	mig                     migParams
+	backendService          backendServiceParams
+	instanceTemplate        string
+	cloudLoadBalancerURLMap string
 }
 
 type migParams struct {
-	project                 string
-	region                  string
-	zone                    string
-	instanceGroupManager    string
+	project                  string
+	region                   string
+	zone                     string
+	instanceGroupManager     string
 	instanceGroupManagerPath string
 }
 
@@ -63,17 +63,18 @@ type backendServiceParams struct {
 func determineParams() (*params, error) {
 	migProject := os.Getenv(projectMIGEnvKey)
 	bsProject := os.Getenv(projectBackendServiceEnvKey)
-	if migProject == "" && bsProject == "" {
+	if migProject == "" || bsProject == "" {
 		return nil, fmt.Errorf("parameter %q or %q is required", projectMIGEnvKey, projectBackendServiceEnvKey)
 	}
 
 	migRegion := os.Getenv(regionMIGEnvKey)
 	bsRegion := os.Getenv(regionBackendServiceEnvKey)
 	migZone := os.Getenv(zoneMIGEnvKey)
+	fmt.Println("env vars are ", os.Environ())
 	if migRegion == "" && migZone == "" {
 		return nil, fmt.Errorf("one of parameter %q or %q is required", regionMIGEnvKey, zoneMIGEnvKey)
 	}
-
+	// TODO(AGENT): validate the required fields are set.
 	return &params{
 		mig: migParams{
 			project:                  migProject,

@@ -28,6 +28,8 @@ const (
 	// The name of the GCE deployer sample, this is passed back to Cloud Deploy
 	// as metadata in the render and deploy results.
 	gceDeployerSampleName = "clouddeploy-gce-sample"
+	// Path to use when unarchiving the source input.
+	srcPath = "/workspace/source"
 )
 
 func main() {
@@ -52,6 +54,7 @@ func do() error {
 	if err != nil {
 		return fmt.Errorf("unable to determine params: %v", err)
 	}
+	fmt.Println("parameters are ", params)
 	h, err := createRequestHandler(ctx, req, params, gcsClient)
 	if err != nil {
 		return err
@@ -85,6 +88,7 @@ func createRequestHandler(ctx context.Context, cloudDeployRequest any, params *p
 			params:    params,
 			gcsClient: gcsClient,
 			gceClient: gceClient,
+			srcPath:   srcPath,
 		}, nil
 
 	default:

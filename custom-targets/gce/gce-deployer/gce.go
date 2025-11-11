@@ -38,7 +38,8 @@ const (
 )
 
 var (
-	urlMapRegex = regexp.MustCompile("projects/(?P<project>[^/]+)/locations/(?P<location>[^/]+)/urlMaps/(?P<name>.+)")
+	urlMapRegionalRegex = regexp.MustCompile("projects/(?P<project>[^/]+)/regions/(?P<location>[^/]+)/urlMaps/(?P<name>.+)")
+	urlMapGlobalRegex   = regexp.MustCompile("projects/(?P<project>[^/]+)/global/urlMaps/(?P<name>.+)")
 )
 
 // GceClient provides an interface for interacting with GCE services.
@@ -174,7 +175,7 @@ func (g *GceClient) GetMIG(ctx context.Context, params *migParams, migName strin
 // UpdateBackendService creates or updates a Backend Service.
 func (g *GceClient) UpdateBackendService(ctx context.Context, params *backendServiceParams, bs *computepb.BackendService) error {
 	fmt.Printf("Updating Backend Service %s\n", *bs.Name)
-	isRegional := params.region != "" && bs.Region != nil
+	isRegional := strings.ToLower(params.region) != GLOBAL
 	var existing *computepb.BackendService
 	var getErr error
 
@@ -242,7 +243,7 @@ func (g *GceClient) UpdateBackendService(ctx context.Context, params *backendSer
 // GetBackendService retrieves a Backend Service.
 func (g *GceClient) GetBackendService(ctx context.Context, params *backendServiceParams) (*computepb.BackendService, error) {
 	fmt.Printf("Getting Backend Service %s\n", params.name)
-	isRegional := params.region != ""
+	isRegional := strings.ToLower(params.region) != GLOBAL
 	var bs *computepb.BackendService
 	var err error
 
@@ -272,20 +273,20 @@ func (g *GceClient) GetBackendService(ctx context.Context, params *backendServic
 
 // GetURLMap retrieves a URL Map.
 func (g *GceClient) GetURLMap(ctx context.Context, params *params) (*computepb.UrlMap, error) {
-	isRegional, urlMapName, err := parseURLMap(params.cloudLoadBalancerURLMap)
+	isRegional, urlMapName, region, project, err := parseURLMap(params.cloudLoadBalancerURLMap)
 	if err != nil {
 		return nil, err
 	}
 
 	if isRegional {
 		return g.regionURLMapsClient.Get(ctx, &computepb.GetRegionUrlMapRequest{
-			Project: params.backendService.project,
-			Region:  params.backendService.region,
+			Project: project,
+			Region:  region,
 			UrlMap:  urlMapName,
 		}, retryOptions()...)
 	}
 	return g.globalURLMapsClient.Get(ctx, &computepb.GetUrlMapRequest{
-		Project: params.backendService.project,
+		Project: project,
 		UrlMap:  urlMapName,
 	}, retryOptions()...)
 }
@@ -293,7 +294,7 @@ func (g *GceClient) GetURLMap(ctx context.Context, params *params) (*computepb.U
 // PatchURLMap patches a URL Map.
 func (g *GceClient) PatchURLMap(ctx context.Context, params *params, urlMap *computepb.UrlMap) error {
 	fmt.Printf("Patching URL Map %s\n", params.cloudLoadBalancerURLMap)
-	isRegional, urlMapName, err := parseURLMap(params.cloudLoadBalancerURLMap)
+	isRegional, urlMapName, region, project, err := parseURLMap(params.cloudLoadBalancerURLMap)
 	if err != nil {
 		return err
 	}
@@ -301,14 +302,14 @@ func (g *GceClient) PatchURLMap(ctx context.Context, params *params, urlMap *com
 	var op *compute.Operation
 	if isRegional {
 		op, err = g.regionURLMapsClient.Patch(ctx, &computepb.PatchRegionUrlMapRequest{
-			Project:        params.backendService.project,
-			Region:         params.backendService.region,
+			Project:        project,
+			Region:         region,
 			UrlMap:         urlMapName,
 			UrlMapResource: urlMap,
 		}, retryOptions()...)
 	} else {
 		op, err = g.globalURLMapsClient.Patch(ctx, &computepb.PatchUrlMapRequest{
-			Project:        params.backendService.project,
+			Project:        project,
 			UrlMap:         urlMapName,
 			UrlMapResource: urlMap,
 		}, retryOptions()...)
@@ -403,25 +404,47 @@ func retryOptions() []gax.CallOption {
 	}
 }
 
-func parseURLMap(urlMap string) (bool, string, error) {
-	match := urlMapRegex.FindStringSubmatch(urlMap)
-	if match == nil {
-		return false, "", fmt.Errorf("invalid URL map format: %s", urlMap)
+func parseURLMap(urlMap string) (bool, string, string, string, error) {
+	var match []string
+	var regex *regexp.Regexp
+	var isRegional bool
+	var location string
+
+	match = urlMapRegionalRegex.FindStringSubmatch(urlMap)
+	if match != nil {
+		regex = urlMapRegionalRegex
+		isRegional = true
+	} else {
+		match = urlMapGlobalRegex.FindStringSubmatch(urlMap)
+		if match != nil {
+			regex = urlMapGlobalRegex
+			isRegional = false
+			location = "global"
+		}
+	}
+
+	if regex == nil {
+		return false, "", "", "", fmt.Errorf("invalid URL map format: %s", urlMap)
 	}
 
 	result := make(map[string]string)
-	for i, name := range urlMapRegex.SubexpNames() {
-		if i != 0 && name != "" {
+	for i, name := range regex.SubexpNames() {
+		if i > 0 && name != "" {
 			result[name] = match[i]
 		}
 	}
 
-	location, okL := result["location"]
-	name, okN := result["name"]
-
-	if !okL || !okN {
-		return false, "", fmt.Errorf("invalid URL map format, missing location or name: %s", urlMap)
+	name, ok := result["name"]
+	if !ok {
+		return false, "", "", "", fmt.Errorf("invalid URL map format, missing name: %s", urlMap)
 	}
 
-	return location != "global", name, nil
+	if isRegional {
+		location, ok = result["location"]
+		if !ok {
+			return false, "", "", "", fmt.Errorf("invalid URL map format, missing location for regional map: %s", urlMap)
+		}
+	}
+
+	return isRegional, name, location, result["project"], nil
 }

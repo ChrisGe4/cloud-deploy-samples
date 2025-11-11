@@ -31,8 +31,6 @@ import (
 const (
 	// Path to use when downloading the source input archive file.
 	srcArchivePath = "/workspace/archive.tgz"
-	// Path to use when unarchiving the source input.
-	srcPath = "/workspace/source"
 	// Name of the archive uploaded at render time that will be downloaded at deploy time.
 	renderedArchiveName = "gce-archive.tgz"
 	// Default name for the InstanceGroupManager manifest.
@@ -115,7 +113,7 @@ func (r *renderer) render(ctx context.Context) (*clouddeploy.RenderResult, error
 		bsPath = defaultBackendServiceManifest
 	}
 	fullBsPath := path.Join(srcPath, bsPath)
-
+	fmt.Println("bs path is ", fullBsPath)
 	hydratedIgmBytes, igm, err := hydrateInstanceGroupManager(fullIgmPath, allParams, r.req.Release)
 	if err != nil {
 		return nil, fmt.Errorf("failed to hydrate InstanceGroupManager manifest: %v", err)
@@ -128,6 +126,7 @@ func (r *renderer) render(ctx context.Context) (*clouddeploy.RenderResult, error
 
 	allManifests := hydratedIgmBytes
 	if _, err := os.Stat(fullBsPath); err == nil {
+		fmt.Println("start hydrating the backend service ")
 		hydratedBsBytes, err := hydrateBackendService(fullBsPath, allParams)
 		if err != nil {
 			return nil, fmt.Errorf("failed to hydrate BackendService manifest: %v", err)

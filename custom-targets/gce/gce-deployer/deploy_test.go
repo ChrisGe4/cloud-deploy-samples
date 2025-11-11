@@ -2,7 +2,6 @@
 
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
-// You may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 
 //     https://www.apache.org/licenses/LICENSE-2.0
@@ -17,12 +16,16 @@ package main
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
 
 	computepb "cloud.google.com/go/compute/apiv1/computepb"
+	"cloud.google.com/go/storage"
+	"github.com/GoogleCloudPlatform/cloud-deploy-samples/custom-targets/util/clouddeploy"
 	"github.com/google/go-cmp/cmp"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -179,4 +182,172 @@ func TestSetRouteWeight(t *testing.T) {
 			t.Errorf("expected stable backend service weight to be 100, got %d", *pathMatcher.RouteRules[0].RouteAction.WeightedBackendServices[0].Weight)
 		}
 	})
+}
+
+type mockDeployRequest struct {
+	clouddeploy.DeployRequest
+	downloadInput func(ctx context.Context, gcsClient *storage.Client, objectSuffix, filePath string) (string, error)
+	uploadResult  func(ctx context.Context, gcsClient *storage.Client, dr *clouddeploy.DeployResult) (string, error)
+	getPercentage func() int
+}
+
+func (m *mockDeployRequest) DownloadInput(ctx context.Context, gcsClient *storage.Client, objectSuffix, filePath string) (string, error) {
+	return m.downloadInput(ctx, gcsClient, objectSuffix, filePath)
+}
+
+func (m *mockDeployRequest) UploadResult(ctx context.Context, gcsClient *storage.Client, dr *clouddeploy.DeployResult) (string, error) {
+	return m.uploadResult(ctx, gcsClient, dr)
+}
+
+func (m *mockDeployRequest) GetPercentage() int {
+	return m.getPercentage()
+}
+
+func TestDeploy(t *testing.T) {
+	tests := []struct {
+		name                   string
+		percentage             int
+		backendServiceProvided bool
+		shouldFail             bool
+	}{
+		{
+			name:                   "Standard deployment - percentage 0",
+			percentage:             0,
+			backendServiceProvided: false,
+			shouldFail:             false,
+		},
+		{
+			name:                   "Canary deployment - percentage 50",
+			percentage:             50,
+			backendServiceProvided: true,
+			shouldFail:             false,
+		},
+		{
+			name:                   "Canary deployment - percentage 50, no backend service name",
+			percentage:             50,
+			backendServiceProvided: false,
+			shouldFail:             true,
+		},
+		{
+			name:                   "Standard deployment - percentage 100",
+			percentage:             100,
+			backendServiceProvided: true,
+			shouldFail:             false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			tmpDir := t.TempDir()
+			manifestPath := filepath.Join(tmpDir, "manifest.yaml")
+			manifestContent := `
+apiVersion: compute.deploy.cloud.google.com/v1
+kind: InstanceGroupManager
+metadata:
+  name: "test-mig"
+baseInstanceName: "test-instance"
+---
+apiVersion: compute.deploy.cloud.google.com/v1
+kind: BackendService
+metadata:
+  name: "test-bs"
+port: 80
+`
+
+			if err := os.WriteFile(manifestPath, []byte(manifestContent), 0644); err != nil {
+				t.Fatalf("failed to write manifest file: %v", err)
+			}
+
+			// Mock DeployRequest
+			mockReq := &mockDeployRequest{
+				DeployRequest: clouddeploy.DeployRequest{
+					InputGCSPath:    "gs://test-bucket/input",
+					ManifestGCSPath: "gs://test-bucket/manifest.yaml",
+					OutputGCSPath:   "gs://test-bucket/output",
+				},
+				downloadInput: func(ctx context.Context, gcsClient *storage.Client, objectSuffix, filePath string) (string, error) {
+					t.Logf("DownloadInput mock received filePath: %s", filePath)
+					// Simulate downloading the manifest file
+					if objectSuffix == "manifest.yaml" {
+						if err := os.WriteFile(filePath, []byte(manifestContent), 0644); err != nil {
+							return "", err
+						}
+					}
+					return "gs://test-bucket/test-object", nil
+				},
+				uploadResult: func(ctx context.Context, gcsClient *storage.Client, dr *clouddeploy.DeployResult) (string, error) {
+					return "gs://test-bucket/test-result", nil
+				},
+				getPercentage: func() int {
+					return test.percentage
+				},
+			}
+
+			// Mock GCE client
+			mockGCEClient := &mockGceClient{
+				getMIG: func(ctx context.Context, params *migParams, migName string) (*computepb.InstanceGroupManager, error) {
+					return nil, &googleapi.Error{Code: http.StatusNotFound} // Simulate not found
+				},
+				createMIG: func(ctx context.Context, params *migParams, igm *computepb.InstanceGroupManager) error {
+					return nil
+				},
+				getURLMap: func(ctx context.Context, params *params) (*computepb.UrlMap, error) {
+					return &computepb.UrlMap{Name: proto.String("test-url-map")}, nil
+				},
+				getBackendService: func(ctx context.Context, params *backendServiceParams) (*computepb.BackendService, error) {
+					return nil, &googleapi.Error{Code: http.StatusNotFound} // Simulate not found
+				},
+				updateBackendService: func(ctx context.Context, params *backendServiceParams, bs *computepb.BackendService) error {
+					return nil
+				},
+				patchURLMap: func(ctx context.Context, params *params, urlMap *computepb.UrlMap) error {
+					return nil
+				},
+				deleteMIG: func(ctx context.Context, params *migParams, migName string) error {
+					return nil
+				},
+			}
+
+			// Deployer instance
+			d := &deployer{
+				req: mockReq,
+				params: &params{
+					backendService: backendServiceParams{
+						project: "test-project",
+						region:  "test-region",
+						name:    "test-bs",
+					},
+					mig: migParams{
+						project: "test-project",
+						region:  "test-region",
+					},
+					cloudLoadBalancerURLMap: "test-url-map",
+				},
+				gcsClient: &storage.Client{},
+				gceClient: mockGCEClient,
+				srcPath:   tmpDir,
+			}
+
+			// Log the srcPath used by the deployer
+			t.Logf("Deployer srcPath: %s", d.srcPath)
+
+			if !test.backendServiceProvided {
+				d.params.backendService.name = ""
+			}
+
+			_, err := d.deploy(ctx)
+
+			if test.shouldFail {
+				if err == nil {
+					t.Fatal("expected deploy to fail but it succeeded")
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("deploy failed: %v", err)
+			}
+		})
+	}
 }
