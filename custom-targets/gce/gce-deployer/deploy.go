@@ -25,10 +25,12 @@ import (
 	"path"
 	"slices"
 	"strings"
+	"time"
 
 	computepb "cloud.google.com/go/compute/apiv1/computepb"
 	"cloud.google.com/go/storage"
 	"github.com/GoogleCloudPlatform/cloud-deploy-samples/custom-targets/util/clouddeploy"
+	"github.com/cenkalti/backoff/v5"
 	"github.com/google/go-cpy/cpy"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -127,7 +129,7 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 	}
 
 	beTemplate := manifests.bs.Backends[0]
-	stableSvc := d.params.backendService.name
+	stableSvc := *manifests.bs.Name
 	stableSvcFullName := constructBackendServiceFullName(d.params.backendService.project, d.params.backendService.region, stableSvc)
 	canarySvc := stableSvc + "-canary"
 	canarySvcFullName := constructBackendServiceFullName(d.params.backendService.project, d.params.backendService.region, canarySvc)
@@ -171,6 +173,7 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 				return nil, fmt.Errorf("failed to get canary backend service: %w", err)
 			}
 			canaryBackends = canaryBackendService.GetBackends()
+			canaryBackendService.Backends = nil
 		}
 		stableBackendService := manifests.bs
 		var stableBackends []*computepb.Backend
@@ -196,8 +199,18 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 			return nil, fmt.Errorf("failed to update stable backend service: %w", err)
 		}
 
-		// create the mig either if the backends is empty or it is standard deployment.
-		if len(stableBackendService.GetBackends()) == 0 || percentage == 0 {
+		backendsContainsMIG := func(backends []*computepb.Backend, deployMIG string) bool {
+			for _, backend := range backends {
+				parts := strings.Split(*backend.Group, "/")
+				if parts[len(parts)-1] == deployMIG {
+					return true
+				}
+			}
+			return false
+		}
+		isRollback := !backendsContainsMIG(canaryBackends, migName)
+		// create the mig either if the backends is empty or it is standard deployment or it is a rollback to stable phase.
+		if len(stableBackendService.GetBackends()) == 0 || !d.params.isCanary || isRollback {
 			mig, err := d.getOrCreateMIG(ctx, migName, manifests)
 			if err != nil {
 				return nil, err
@@ -208,6 +221,10 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 				return nil, fmt.Errorf("failed to generate backend service backends: %w", err)
 			}
 			stableBackendService.Backends = bes
+			fmt.Println("Resetting the backends in the stable backend service: ", stableBackendService)
+			if err := d.gceClient.UpdateBackendService(ctx, &d.params.backendService, stableBackendService); err != nil {
+				return nil, fmt.Errorf("failed to update stable backend service: %w", err)
+			}
 		}
 
 		// if err != nil {
@@ -225,33 +242,68 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 		// }
 
 		// stableBackendService.Name = proto.String(stableSvc)
-		if err := d.gceClient.UpdateBackendService(ctx, &d.params.backendService, stableBackendService); err != nil {
-			return nil, fmt.Errorf("failed to update stable backend service: %w", err)
-		}
 
 		setRouteWeightStableWrapper := func(pm *computepb.PathMatcher, stable, canary string, p int) error {
 			return setRouteWeightForStable(pm, stable, canary, int32(p))
 		}
-		if err := d.redirectTraffic(ctx, urlMap, stableSvcFullName, canarySvcFullName, 100, setRouteWeightStableWrapper); err != nil {
+		// Define an exponential backoff policy
+		expBackoff := backoff.NewExponentialBackOff()
+		expBackoff.InitialInterval = 5 * time.Second // Start with 5 seconds
+		expBackoff.MaxInterval = 5 * time.Minute     // Stop after 5 minutes
+		// Define the operation to retry
+		operation := func() (string, error) {
+			if err := d.redirectTraffic(ctx, stableSvcFullName, canarySvcFullName, 100, setRouteWeightStableWrapper); err != nil {
+				var gerr *googleapi.Error
+				if !errors.As(err, &gerr) {
+					return "", backoff.Permanent(err)
+				}
+				fmt.Println("the error is ", gerr)
+				// This error is expected for multi-targets. Deploy jobs for child targets can update the urlmap concurrently.
+				if (gerr.Code == http.StatusPreconditionFailed && strings.Contains(strings.ToLower(gerr.Error()), "invalid fingerprint")) || (gerr.Code == http.StatusBadRequest && strings.Contains(strings.ToLower(gerr.Error()), "not ready")) {
+					return "", backoff.RetryAfter(5)
+				}
+				return "", backoff.Permanent(err)
+			}
+			return "completed", nil
+		}
+		if _, err := backoff.Retry(ctx, operation, backoff.WithBackOff(expBackoff)); err != nil {
 			return nil, err
 		}
 
 		// Clean up process starts here.
 		for _, backend := range stableBackends {
-			parts := strings.Split(*backend.Group, "/")
-			migToDelete := parts[len(parts)-1]
-			fmt.Printf("Deleting old stable MIG %s\n", migToDelete)
-			if err := d.gceClient.DeleteMIG(ctx, &d.params.mig, migToDelete); err != nil {
-				fmt.Printf("failed to delete old stable MIG %s: %v\n", migToDelete, err)
+			if func() bool {
+				for _, b := range stableBackendService.GetBackends() {
+					// this happens when redeploy to the same release
+					if *b.Group == *backend.Group {
+						return true
+					}
+				}
+				return false
+			}() {
+				continue
+			}
+			if err := d.deleteMIG(ctx, backend); err != nil {
+				return nil, err
 			}
 		}
 
-		if percentage == 100 {
-			fmt.Printf("Resetting the backends in the canary backend service %s\n", canarySvc)
-			if canaryBackendService != nil {
-				canaryBackendService.Backends = nil
+		// if d.params.isCanary {
+		fmt.Printf("Resetting the backends in the canary backend service %s\n", canarySvc)
+		if canaryBackendService != nil {
+			canaryBackendService.Backends = nil
+			if err := d.gceClient.UpdateBackendService(ctx, &d.params.backendService, canaryBackendService); err != nil {
+				return nil, fmt.Errorf("failed to update canry backend service: %w", err)
+			}
+			if isRollback {
+				for _, backend := range canaryBackends {
+					if err := d.deleteMIG(ctx, backend); err != nil {
+						return nil, err
+					}
+				}
 			}
 		}
+		// }
 	} else {
 		// The canary phase consists of the following manifest apply steps:
 		//  For the first phase:
@@ -266,6 +318,7 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 		if !backendServiceNameProvided {
 			return nil, fmt.Errorf("backend service name is required for canary deployment")
 		}
+		fmt.Println("start checking the exising ")
 		urlMap, err := d.gceClient.GetURLMap(ctx, d.params)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get URL map: %w", err)
@@ -280,6 +333,43 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 				},
 			}, nil
 		}
+		stableBS, err := d.gceClient.GetBackendService(ctx, &backendServiceParams{
+			project: d.params.backendService.project,
+			region:  d.params.backendService.region,
+			name:    stableSvc,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("failed to get stable backend service: %w", err)
+		}
+		fmt.Println("Current stable backend is ", stableBS)
+		// checking if the mig has been deployed before.
+		removeSuffix := func(s string) string {
+			if i := strings.LastIndex(s, "-"); i != -1 {
+				return s[:i]
+			}
+			return s
+		}
+		migAbsoluteName := removeSuffix(migName)
+		migFullName := constructionMIGFullName(d.params.mig.project, d.params.mig.region, d.params.mig.zone, migAbsoluteName)
+
+		var migExisted bool
+		for _, backend := range stableBS.GetBackends() {
+			if strings.HasPrefix(backend.GetGroup(), migFullName) {
+				migExisted = true
+				break
+			}
+		}
+		if !migExisted {
+			return &clouddeploy.DeployResult{
+				ResultStatus: clouddeploy.DeploySkipped,
+				SkipMessage:  fmt.Sprintf("MIG %s not found in stable backend service %s, skipping canary deployment", migFullName, stableSvc),
+				Metadata: map[string]string{
+					clouddeploy.CustomTargetSourceMetadataKey:    gceDeployerSampleName,
+					clouddeploy.CustomTargetSourceSHAMetadataKey: clouddeploy.GitCommit,
+				},
+			}, nil
+		}
+
 		manifests.bs.Backends = nil
 		manifests.bs.Name = proto.String(canarySvc)
 		if isBackendServiceInURLMap(urlMap, canarySvcFullName) {
@@ -320,14 +410,51 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 		}
 		// manifests.bs.Backends should either be nil(for the first phase) or contains the desired MIG.
 		// Add more checks here for the complex scenario.
-		if len(manifests.bs.Backends) != len(bes) && len(bes) != 0 {
+		backendsOverlapped := func(b1, b2 []*computepb.Backend) bool {
+			for _, b := range b1 {
+				for _, bb := range b2 {
+					if *b.Group == *bb.Group {
+						return true
+					}
+				}
+			}
+			return false
+		}
+		if len(manifests.bs.Backends) == 0 || !backendsOverlapped(manifests.bs.Backends, bes) {
+			toDelete := manifests.bs.Backends
+			fmt.Println("migs to be deleted ", toDelete)
 			manifests.bs.Backends = bes
 			if err := d.gceClient.UpdateBackendService(ctx, &d.params.backendService, manifests.bs); err != nil {
 				return nil, fmt.Errorf("failed to update canary backend service: %w", err)
 			}
+			for _, backend := range toDelete {
+				if err := d.deleteMIG(ctx, backend); err != nil {
+					return nil, err
+				}
+			}
 		}
 
-		if err := d.redirectTraffic(ctx, urlMap, stableSvcFullName, canarySvcFullName, percentage, setRouteWeightForCanary); err != nil {
+		// Define an exponential backoff policy
+		expBackoff := backoff.NewExponentialBackOff()
+		expBackoff.InitialInterval = 5 * time.Second // Start with 5 seconds
+		expBackoff.MaxInterval = 5 * time.Minute     // Stop after 5 minutes
+		// Define the operation to retry
+		operation := func() (string, error) {
+			if err := d.redirectTraffic(ctx, stableSvcFullName, canarySvcFullName, percentage, setRouteWeightForCanary); err != nil {
+				var gerr *googleapi.Error
+				if !errors.As(err, &gerr) {
+					return "", backoff.Permanent(err)
+				}
+				fmt.Println("the error is ", gerr)
+				// This error is expected for multi-targets. Deploy jobs for child targets can update the urlmap concurrently.
+				if (gerr.Code == http.StatusPreconditionFailed && strings.Contains(strings.ToLower(gerr.Error()), "invalid fingerprint")) || (gerr.Code == http.StatusBadRequest && strings.Contains(strings.ToLower(gerr.Error()), "not ready")) {
+					return "", backoff.RetryAfter(5)
+				}
+				return "", backoff.Permanent(err)
+			}
+			return "completed", nil
+		}
+		if _, err := backoff.Retry(ctx, operation, backoff.WithBackOff(expBackoff)); err != nil {
 			return nil, err
 		}
 
@@ -341,6 +468,18 @@ func (d *deployer) deploy(ctx context.Context) (*clouddeploy.DeployResult, error
 		},
 	}
 	return dr, nil
+}
+
+func (d *deployer) deleteMIG(ctx context.Context, backend *computepb.Backend) error {
+	parts := strings.Split(*backend.Group, "/")
+	migToDelete := parts[len(parts)-1]
+
+	fmt.Printf("Deleting old stable MIG %s\n", migToDelete)
+	if err := d.gceClient.DeleteMIG(ctx, &d.params.mig, migToDelete); err != nil {
+		fmt.Printf("failed to delete the MIG %s: %v\n", *backend.Group, err)
+		return err
+	}
+	return nil
 }
 
 func (d *deployer) getOrCreateMIG(ctx context.Context, migName string, manifests *manifests) (*computepb.InstanceGroupManager, error) {
@@ -373,6 +512,10 @@ func (d *deployer) parseManifests(manifestPath string) (*manifests, error) {
 
 	var m manifests
 	yamls := strings.Split(string(data), "\n---\n")
+	if len(yamls) > 2 {
+		return nil, fmt.Errorf("more than two resources in the manifest")
+	}
+	numOfMig, numOfBS := 0, 0
 	for _, y := range yamls {
 		var obj map[string]interface{}
 		if err := sigsk8s.Unmarshal([]byte(y), &obj); err != nil {
@@ -399,6 +542,9 @@ func (d *deployer) parseManifests(manifestPath string) (*manifests, error) {
 		fmt.Printf("JSON Bytes for %s: %s\n", kind, string(jsonBytes))
 		switch kind {
 		case "InstanceGroupManager":
+			if numOfMig > 0 {
+				return nil, fmt.Errorf("more than one InstanceGroupManager in the manifest")
+			}
 			var igm computepb.InstanceGroupManager
 			if err := protojson.Unmarshal(jsonBytes, &igm); err != nil {
 				return nil, fmt.Errorf("failed to unmarshal InstanceGroupManager: %w", err)
@@ -409,7 +555,11 @@ func (d *deployer) parseManifests(manifestPath string) (*manifests, error) {
 			}
 			igm.Name = &name
 			m.igm = &igm
+			numOfMig++
 		case "BackendService":
+			if numOfBS > 0 {
+				return nil, fmt.Errorf("more than one BackendService in the manifest")
+			}
 			var bs computepb.BackendService
 			if err := protojson.Unmarshal(jsonBytes, &bs); err != nil {
 				return nil, fmt.Errorf("failed to unmarshal BackendService: %w", err)
@@ -420,6 +570,9 @@ func (d *deployer) parseManifests(manifestPath string) (*manifests, error) {
 			}
 			bs.Name = &name
 			m.bs = &bs
+			numOfBS++
+		default:
+			return nil, fmt.Errorf("unknown kind: %s", kind)
 		}
 	}
 	if m.igm == nil {
@@ -481,58 +634,67 @@ func ParseMIG(bytes []byte, name string) (*computepb.InstanceGroupManager, error
 }
 
 func isBackendServiceInURLMap(urlMap *computepb.UrlMap, backendService string) bool {
-	for _, pm := range urlMap.GetPathMatchers() {
-		for _, rr := range pm.GetRouteRules() {
-			if rr.GetRouteAction() != nil {
-				for _, wbs := range rr.GetRouteAction().GetWeightedBackendServices() {
-					if *wbs.BackendService == backendService {
-						return true
-					}
+	fmt.Printf("checking if %s is in the url map\n", backendService)
+	compareFn := func(actions []*computepb.HttpRouteAction) bool {
+		for _, action := range actions {
+			if action == nil {
+				continue
+			}
+			fmt.Println("action is ", action)
+			for _, wbs := range action.GetWeightedBackendServices() {
+				if *wbs.BackendService == backendService {
+					return true
 				}
 			}
 		}
-		for _, wbs := range pm.GetDefaultRouteAction().GetWeightedBackendServices() {
-			if *wbs.BackendService == backendService {
-				return true
-			}
+		return false
+	}
+	var actions []*computepb.HttpRouteAction
+	for _, pm := range urlMap.GetPathMatchers() {
+		actions = []*computepb.HttpRouteAction{pm.GetDefaultRouteAction()}
+		for _, r := range pm.GetRouteRules() {
+			actions = append(actions, r.GetRouteAction())
 		}
+		for _, r := range pm.GetPathRules() {
+			actions = append(actions, r.GetRouteAction())
+		}
+
 	}
 
-	return false
+	return compareFn(actions)
+}
+
+type rule interface {
+	GetRouteAction() *computepb.HttpRouteAction
 }
 
 func setRouteWeightForCanary(path *computepb.PathMatcher, stableBS, canaryBS string, percentage int) error {
 	if path == nil {
-		return nil
+		return fmt.Errorf("path not specified")
 	}
-
-	for _, rule := range path.GetRouteRules() {
-		action := rule.GetRouteAction()
-		if action == nil {
-			continue
-		}
-		weightedBS := action.GetWeightedBackendServices()
-		for _, dest := range weightedBS {
-			if dest.GetBackendService() == stableBS {
-				normalizeRouteWeight(weightedBS)
-				action.WeightedBackendServices = addRouteCanaryBackendService(weightedBS, dest, canaryBS, percentage)
-				break
+	setWeightFn := func(actions []*computepb.HttpRouteAction) {
+		for _, action := range actions {
+			if action == nil {
+				continue
+			}
+			weightedBS := action.GetWeightedBackendServices()
+			for _, dest := range weightedBS {
+				if dest.GetBackendService() == stableBS {
+					normalizeRouteWeight(weightedBS)
+					action.WeightedBackendServices = addRouteCanaryBackendService(weightedBS, dest, canaryBS, percentage)
+					break
+				}
 			}
 		}
 	}
-	action := path.GetDefaultRouteAction()
-	if action == nil {
-		return nil
+	actions := []*computepb.HttpRouteAction{path.GetDefaultRouteAction()}
+	for _, r := range path.GetRouteRules() {
+		actions = append(actions, r.GetRouteAction())
 	}
-	weightedBS := action.GetWeightedBackendServices()
-	for _, dest := range weightedBS {
-		if dest.GetBackendService() == stableBS {
-			normalizeRouteWeight(weightedBS)
-			action.WeightedBackendServices = addRouteCanaryBackendService(weightedBS, dest, canaryBS, percentage)
-			break
-		}
+	for _, r := range path.GetPathRules() {
+		actions = append(actions, r.GetRouteAction())
 	}
-
+	setWeightFn(actions)
 	return nil
 }
 
@@ -541,23 +703,29 @@ func setRouteWeightForStable(path *computepb.PathMatcher, stableBS, canaryBS str
 		return fmt.Errorf("path not specified")
 	}
 
-	for _, r := range path.GetRouteRules() {
-		if r.GetRouteAction() == nil {
-			continue
+	setWeightFn := func(actions []*computepb.HttpRouteAction) error {
+		for _, action := range actions {
+			if action == nil {
+				continue
+			}
+			if err := setStableWeight(path.GetName(), stableBS, canaryBS, action); err != nil {
+				return err
+			}
+
 		}
-		err := setStableWeight(path.GetName(), stableBS, canaryBS, r.GetRouteAction())
-		if err != nil {
-			return err
-		}
-	}
-	action := path.GetDefaultRouteAction()
-	if action == nil {
 		return nil
 	}
-	err := setStableWeight(path.GetName(), stableBS, canaryBS, action)
-	if err != nil {
+	actions := []*computepb.HttpRouteAction{path.GetDefaultRouteAction()}
+	for _, r := range path.GetRouteRules() {
+		actions = append(actions, r.GetRouteAction())
+	}
+	for _, r := range path.GetPathRules() {
+		actions = append(actions, r.GetRouteAction())
+	}
+	if err := setWeightFn(actions); err != nil {
 		return err
 	}
+
 	return nil
 }
 
@@ -643,9 +811,10 @@ func addRouteCanaryBackendService(weightedBs []*computepb.WeightedBackendService
 
 // redirectTraffic redirects traffic between the canary backend service and
 // the stable backend service by updating their weights in the specified route.
-func (d *deployer) redirectTraffic(ctx context.Context, urlMap *computepb.UrlMap, stableBSFullname, canaryBSFullname string, percentage int, setRouteWeightFn func(*computepb.PathMatcher, string, string, int) error) error {
-	if urlMap == nil {
-		return nil
+func (d *deployer) redirectTraffic(ctx context.Context, stableBSFullname, canaryBSFullname string, percentage int, setRouteWeightFn func(*computepb.PathMatcher, string, string, int) error) error {
+	urlMap, err := d.gceClient.GetURLMap(ctx, d.params)
+	if err != nil {
+		return fmt.Errorf("failed to get URL map: %w", err)
 	}
 	fmt.Println("Updating the weights in the url map")
 
@@ -666,9 +835,9 @@ func (d *deployer) redirectTraffic(ctx context.Context, urlMap *computepb.UrlMap
 // the first rule with the stable backend service, or add the backend service to
 // the existing single rule in the case of multi-target deployments.
 func initializeBackendServiceInTheRoute(urlMap *computepb.UrlMap, stableBSFullname string) {
-	if len(urlMap.GetPathMatchers()) > 1 {
-		return
-	}
+	// if len(urlMap.GetPathMatchers()) > 1 {
+	// 	return
+	// }
 	if len(urlMap.GetPathMatchers()) == 0 {
 		urlMap.PathMatchers = []*computepb.PathMatcher{
 			{
@@ -699,31 +868,44 @@ func initializeBackendServiceInTheRoute(urlMap *computepb.UrlMap, stableBSFullna
 		urlMap.DefaultService = &stableBSFullname
 		return
 	}
-	for _, dest := range urlMap.GetPathMatchers()[0].GetDefaultRouteAction().GetWeightedBackendServices() {
-		if dest.GetBackendService() == stableBSFullname {
-			return
-		}
-	}
-	for _, rule := range urlMap.GetPathMatchers()[0].GetRouteRules() {
-		for _, dest := range rule.GetRouteAction().GetWeightedBackendServices() {
+	for _, matcher := range urlMap.GetPathMatchers() {
+		for _, dest := range matcher.GetDefaultRouteAction().GetWeightedBackendServices() {
 			if dest.GetBackendService() == stableBSFullname {
 				return
 			}
 		}
+		for _, rule := range matcher.GetRouteRules() {
+			for _, dest := range rule.GetRouteAction().GetWeightedBackendServices() {
+				if dest.GetBackendService() == stableBSFullname {
+					return
+				}
+			}
+		}
+		for _, rule := range matcher.GetPathRules() {
+			for _, dest := range rule.GetRouteAction().GetWeightedBackendServices() {
+				if dest.GetBackendService() == stableBSFullname {
+					return
+				}
+			}
+		}
 	}
-	if len(urlMap.GetPathMatchers()[0].GetRouteRules()) > 1 {
-		return
-	}
-	//  default route action first has higher priority.
+
+	// if len(urlMap.GetPathMatchers()[0].GetRouteRules()) > 1 {
+	// 	return
+	// }
+	//  default route action has higher priority.
 	if urlMap.GetPathMatchers()[0].GetDefaultRouteAction() != nil {
 		action := urlMap.GetPathMatchers()[0].GetDefaultRouteAction()
 		action.WeightedBackendServices = append(action.WeightedBackendServices, &computepb.WeightedBackendService{BackendService: &stableBSFullname, Weight: proto.Uint32(0)})
-
 	}
-	if len(urlMap.GetPathMatchers()[0].GetRouteRules()) == 1 {
-		action := urlMap.GetPathMatchers()[0].GetRouteRules()[0].GetRouteAction()
-		action.WeightedBackendServices = append(action.WeightedBackendServices, &computepb.WeightedBackendService{BackendService: &stableBSFullname, Weight: proto.Uint32(0)})
-	}
+	// if len(urlMap.GetPathMatchers()[0].GetRouteRules()) != 0 {
+	// 	action := urlMap.GetPathMatchers()[0].GetRouteRules()[0].GetRouteAction()
+	// 	action.WeightedBackendServices = append(action.WeightedBackendServices, &computepb.WeightedBackendService{BackendService: &stableBSFullname, Weight: proto.Uint32(0)})
+	// }
+	// if len(urlMap.GetPathMatchers()[0].GetPathRules()) != 0 {
+	// 	action := urlMap.GetPathMatchers()[0].GetPathRules()[0].GetRouteAction()
+	// 	action.WeightedBackendServices = append(action.WeightedBackendServices, &computepb.WeightedBackendService{BackendService: &stableBSFullname, Weight: proto.Uint32(0)})
+	// }
 
 }
 
@@ -734,6 +916,15 @@ func constructBackendServiceFullName(project, region, name string) string {
 		return fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/global/backendServices/%s", project, name)
 	}
 	return fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/regions/%s/backendServices/%s", project, region, name)
+}
+
+func constructionMIGFullName(project, region, zone, name string) string {
+	if len(region) != 0 {
+		return fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/regions/%s/instanceGroups/%s", project, region, name)
+	} else {
+		return fmt.Sprintf("https://www.googleapis.com/compute/v1/projects/%s/zones/%s/instanceGroups/%s", project, zone, name)
+
+	}
 }
 
 // gceClientInterface provides an interface for mocking the GCE client.

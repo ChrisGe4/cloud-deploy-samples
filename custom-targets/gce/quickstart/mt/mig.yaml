@@ -1,0 +1,7 @@
+apiVersion: compute.deploy.cloud.google.com/v1
+kind: InstanceGroupManager
+metadata:
+  name: mig # from-param ${customTarget/gceMigName}
+spec:
+  instance_template: projects/chris-test1-475920/global/instanceTemplates/l7-ilb-backend-template
+  target_size: 1

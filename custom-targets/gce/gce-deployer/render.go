@@ -114,7 +114,7 @@ func (r *renderer) render(ctx context.Context) (*clouddeploy.RenderResult, error
 	}
 	fullBsPath := path.Join(srcPath, bsPath)
 	fmt.Println("bs path is ", fullBsPath)
-	hydratedIgmBytes, igm, err := hydrateInstanceGroupManager(fullIgmPath, allParams, r.req.Release)
+	hydratedIgmBytes, igm, err := hydrateInstanceGroupManager(fullIgmPath, allParams, r.req.Release, r.params.instanceTemplate)
 	if err != nil {
 		return nil, fmt.Errorf("failed to hydrate InstanceGroupManager manifest: %v", err)
 	}
@@ -169,7 +169,7 @@ func hydrateBackendService(path string, params map[string]string) ([]byte, error
 	return hydrated, nil
 }
 
-func hydrateInstanceGroupManager(path string, params map[string]string, releaseName string) ([]byte, *yaml.Node, error) {
+func hydrateInstanceGroupManager(path string, params map[string]string, releaseName string, instanceTemplate string) ([]byte, *yaml.Node, error) {
 	_, node, err := hydrate(path, params)
 	if err != nil {
 		return nil, nil, err
@@ -194,6 +194,19 @@ func hydrateInstanceGroupManager(path string, params map[string]string, releaseN
 		name = name[:maxBaseNameLength]
 	}
 	n.Value = name + suffix
+
+	// set instance template
+	s, err := findMapValue(node.Content[0], "spec")
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid InstanceGroupManager manifest: missing spec")
+	}
+	t, err := findMapValue(s, "instance_template")
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid InstanceGroupManager manifest: missing spec.instance_template")
+	}
+	if len(instanceTemplate) > 0 {
+		t.Value = instanceTemplate
+	}
 
 	var hydrated bytes.Buffer
 	encoder := yaml.NewEncoder(&hydrated)

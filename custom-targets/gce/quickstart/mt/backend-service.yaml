@@ -1,0 +1,15 @@
+apiVersion: compute.deploy.cloud.google.com/v1
+kind: BackendService
+metadata:
+  name: bs # from-param ${customTarget/gceBackendService}
+spec:
+  backends:
+  - balancingMode: UTILIZATION
+  description: Cloud Deploy managed backend service
+  healthChecks:
+  - https://www.googleapis.com/compute/v1/projects/chris-test1-475920/global/healthChecks/gce-health-check
+  loadBalancingScheme: INTERNAL_MANAGED
+  port: 80
+  portName: http
+  protocol: HTTP
+  timeoutSec: 30

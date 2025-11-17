@@ -9,6 +9,7 @@ require (
 	cloud.google.com/go/secretmanager v1.15.0
 	cloud.google.com/go/storage v1.56.0
 	github.com/avast/retry-go/v4 v4.6.1
+	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/fsouza/fake-gcs-server v1.52.2
 	github.com/ghodss/yaml v1.0.0
 	github.com/google/go-cmp v0.7.0
